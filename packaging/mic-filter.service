@@ -1,0 +1,16 @@
+[Unit]
+Description=mic-filter virtual microphone
+Documentation=https://github.com/tylerhartless/mic-audio-filter
+After=pipewire.service wireplumber.service
+BindsTo=pipewire.service
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mic-filter run
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=yes
+Slice=session.slice
+
+[Install]
+WantedBy=pipewire.service

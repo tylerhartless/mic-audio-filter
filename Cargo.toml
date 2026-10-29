@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["crates/dsp", "crates/mic-filter"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+repository = "https://github.com/tylerhartless/mic-audio-filter"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

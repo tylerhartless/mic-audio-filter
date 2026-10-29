@@ -1,0 +1,11 @@
+[package]
+name = "mic-filter-dsp"
+description = "Portable voice processing chain: gain, high-pass, RNNoise, EQ, compressor, limiter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+nnnoiseless = { version = "0.5", default-features = false }
+serde = { version = "1", features = ["derive"] }
