@@ -5,7 +5,7 @@ members = ["crates/dsp", "crates/mic-filter"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.95"
 repository = "https://github.com/tylerhartless/mic-audio-filter"
 
 [profile.release]

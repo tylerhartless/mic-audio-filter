@@ -5,6 +5,7 @@
 
 pub mod biquad;
 pub mod chain;
+pub mod deesser;
 pub mod denoise;
 pub mod dynamics;
 pub mod settings;

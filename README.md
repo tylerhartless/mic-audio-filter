@@ -1,6 +1,6 @@
 # mic-filter
 
-mic-filter processes your microphone once for every app. It reads any mic you choose, runs it through gain, a high-pass filter, RNNoise noise suppression, EQ, a compressor and a limiter, and publishes the result as a virtual mic named **Mic Filter**. Every app that selects Mic Filter hears the same processed voice, so per-app noise suppression and auto gain can stay off.
+mic-filter processes your microphone once for every app. It reads any mic you choose, runs it through gain, a high-pass filter, RNNoise noise suppression, EQ, a compressor, a de-esser and a limiter, and publishes the result as a virtual mic named **Mic Filter**. Every app that selects Mic Filter hears the same processed voice, so per-app noise suppression and auto gain can stay off.
 
 Linux with PipeWire is supported today. macOS and Windows are planned.[*](#speculation)
 
@@ -10,7 +10,7 @@ Linux with PipeWire is supported today. macOS and Windows are planned.[*](#specu
 real mic --> mic-filter --> "Mic Filter" virtual mic --> Discord, Zoom, OBS, browsers, ...
 
 inside mic-filter:
-  input gain -> high-pass -> RNNoise -> EQ -> compressor -> output gain -> limiter
+  input gain -> high-pass -> RNNoise -> EQ -> compressor -> de-esser -> output gain -> limiter
 ```
 
 - mic-filter is a separate process. If it crashes, PipeWire and the rest of your audio keep running.
@@ -23,7 +23,7 @@ inside mic-filter:
 ## Requirements
 
 - Linux with PipeWire 1.0 or newer and WirePlumber.
-- Rust 1.80 or newer. Install it with [rustup](https://rustup.rs).
+- Rust 1.95 or newer. Install it with [rustup](https://rustup.rs).
 - PipeWire development headers and clang:
 
   | Distro | Command |
@@ -43,8 +43,9 @@ cd mic-audio-filter
 The script:
 
 1. Builds mic-filter and installs it to `~/.cargo/bin/mic-filter`.
-2. Writes `~/.config/mic-filter/config.toml` if no config exists yet. The starting mic is the system default when that is a real mic, otherwise the one that looks most like a headset. Change it any time with `mic-filter use`.
-3. Installs and starts the `mic-filter` systemd user service, which starts with PipeWire at login.
+2. Writes `~/.config/mic-filter/config.toml` if no config exists yet. The starting mic is the system default when that is a real mic, otherwise the one that looks most like a headset. Change it any time in the window or with `mic-filter use`.
+3. Adds **Mic Filter** to your app menu. It opens the tuning window.
+4. Installs and starts the `mic-filter` systemd user service, which starts with PipeWire at login.
 
 Then pick **Mic Filter** as the input in each app, or make it the system default:
 
@@ -87,8 +88,9 @@ When the chosen mic is unplugged, PipeWire moves the capture to another availabl
 
 | Command | Effect |
 | --- | --- |
+| `mic-filter gui` | Opens the tuning window. |
 | `mic-filter run` | Runs the virtual mic. This is the default when no command is given. |
-| `mic-filter run --meter` | Same, with a live level meter. |
+| `mic-filter run --meter` | Same, with a live level meter in the terminal. |
 | `mic-filter list` | Lists the mics, numbered, with the one in use and the system default marked. |
 | `mic-filter use [mic]` | Switches to a mic: a number, part of a name, a full node name, or `default`. Asks when no mic is given. |
 | `mic-filter init` | Writes a starter config. `--device <mic>` picks the mic, `--force` overwrites. |
@@ -98,34 +100,63 @@ Every command takes `--config <path>` to use a config other than `~/.config/mic-
 
 ## Tuning
 
-The service and a manual `run` would both create a Mic Filter node, so stop the service while tuning:
+Open **Mic Filter** from the app menu, or run `mic-filter gui`.
+
+![The Mic Filter window](docs/gui.png)
+
+- **Mic:** the mic to process. Switching happens live.
+- **Your level:** say a few words, and the bar tells you whether you're too quiet, too loud, or good. **Hear myself** plays your processed mic into your headphones.
+- **Mic boost:** turn it up if you're too quiet.
+- **Remove background noise, Even out my volume, Soften harsh S sounds, Reduce pops and rumble:** pick Off, Light, Medium or Strong.
+
+Every change saves and applies right away.
+
+### Advanced settings
+
+**Advanced settings**, at the bottom of the window, opens every setting. **Simple view** goes back.
+
+![Advanced settings](docs/gui-advanced.png)
+
+- **Equalizer:** the curve is the combined response of the high-pass and every EQ band. Drag a dot to move a band, scroll over it to change its width (Q), double-click the curve to add a band, and right-click a dot to remove it. The row under the curve edits the selected band's type, frequency, gain and Q.
+- **Input, Noise removal, Compressor, De-esser, Output:** every other setting, with a hint under each card.
+- **Levels:** four live meters. The shaded zones are the targets while you talk.
+- **Live preview** keeps the mic running while the window is open, so the meters move even when no app is recording.
+
+The four simple controls are presets for these settings. A setting changed by hand here shows as **Custom** in the simple view until you pick a level again.
+
+The window, the service and the config file stay in sync: an edit made in a text editor shows up in the window within a second.
+
+| Meter | Meaning | Target while speaking |
+| --- | --- | --- |
+| In | Peak level after the input gain | -18 to -10 dB. Raise the input gain if lower. |
+| Out | Peak level of what apps receive | -9 to -3 dB. Adjust the compressor's makeup gain or the output gain. |
+| Comp | Gain reduction from the compressor | 3 to 8 dB. More means the threshold is too low. |
+| Voice | RNNoise's confidence that you are talking | High while talking, near 0 while silent. |
+
+Common adjustments:
+
+- **Background noise between sentences:** pick Strong under Remove background noise, which mutes the mic when you're not talking. If word endings get cut off, raise Gate hold under Advanced.
+- **Voice sounds watery or robotic:** pick Light under Remove background noise.
+- **S sounds still harsh on Strong:** under Advanced, lower the De-esser threshold, or move its frequency to where your S sounds are sharpest.
+- **Boomy or muddy:** pick Strong under Reduce pops and rumble, or cut around 200 to 300 Hz in the EQ.
+- **Mains hum:** add a notch band at 60 Hz with a Q of 10 (50 Hz in Europe and most of Asia).
+
+### From the terminal
+
+The service and a manual `run` would both create a Mic Filter node, so stop the service first:
 
 ```bash
 systemctl --user stop mic-filter
 mic-filter run --meter
 ```
 
-Record from Mic Filter in any app (or `pw-record --target mic_filter /dev/null`) and talk normally. The meter shows:
+Record from Mic Filter in any app and talk normally. The meter line shows the same four readings:
 
 ```
 in  -16.2 dB [#############       ]  out  -6.8 dB [##################  ]  comp -5.1 dB  voice  97%
 ```
 
-| Reading | Meaning | Target while speaking |
-| --- | --- | --- |
-| `in` | Peak level after `gain.input_db` | -18 to -10 dB. Raise `input_db` if lower. |
-| `out` | Peak level of what apps receive | -9 to -3 dB. Adjust `compressor.makeup_db` or `gain.output_db`. |
-| `comp` | Gain reduction from the compressor | 3 to 8 dB. More means `threshold_db` is too low. |
-| `voice` | RNNoise's confidence that you are talking | High while talking, near 0 while silent. |
-
-Edit `~/.config/mic-filter/config.toml` in another window and save. Changes apply within half a second. When you're done, press Ctrl+C and run `systemctl --user start mic-filter`.
-
-Common adjustments:
-
-- **Background noise between sentences:** set `denoise.vad_threshold` to 0.5 to 0.8. This mutes the mic when RNNoise doesn't detect speech. Raise `vad_hold_ms` if word endings get cut off.
-- **Voice sounds watery or robotic:** lower `denoise.strength` to 0.8 or 0.9.
-- **Boomy or muddy:** cut more around 200 to 300 Hz in `[eq]`, or raise `highpass.freq_hz` to 100.
-- **Mains hum:** add `{ type = "notch", freq_hz = 60.0, q = 10.0 }` to the EQ bands (50 Hz in Europe and most of Asia).
+Edit `~/.config/mic-filter/config.toml` in another window and save. When you're done, press Ctrl+C and run `systemctl --user start mic-filter`.
 
 ## Configuration
 
@@ -140,6 +171,7 @@ Common adjustments:
 | `[denoise]` | RNNoise suppression with `strength`, plus the optional voice gate. | Yes |
 | `[eq]` | Up to 16 bands: `peaking`, `low_shelf`, `high_shelf`, `low_pass`, `high_pass`, `notch`. | Yes |
 | `[compressor]` | Soft-knee compressor: `threshold_db`, `ratio`, `knee_db`, `attack_ms`, `release_ms`, `makeup_db`. | Yes |
+| `[deesser]` | Cuts the band around `freq_hz` while it's louder than `threshold_db`, by up to `max_reduction_db`. | Yes |
 | `[limiter]` | Peak limiter at `ceiling_db`, so the output never clips. | Yes |
 
 Unknown keys and out-of-range values are errors, so mic-filter reports typos.
@@ -168,7 +200,7 @@ If PipeWire restarts, mic-filter exits and systemd starts it again against the n
 | Path | Contents |
 | --- | --- |
 | `crates/dsp` | The processing chain. Pure Rust with no OS or audio-device code, so it carries over to other platforms. |
-| `crates/mic-filter` | The program: CLI, config, and the PipeWire backend (`engine.rs`). |
+| `crates/mic-filter` | The program: CLI, config, the PipeWire backend (`engine.rs`), the meter socket (`ipc.rs`), and the window (`gui/`). |
 | `packaging/mic-filter.service` | systemd user unit. |
 | `scripts/install.sh` | Build, install and enable. |
 
@@ -180,7 +212,7 @@ cargo clippy --all-targets
 cargo run -- run --meter
 ```
 
-The DSP crate builds and tests on any OS. The `mic-filter` crate needs the PipeWire headers on Linux.
+The DSP crate builds and tests on any OS. The `mic-filter` crate needs the PipeWire headers on Linux. `cargo build --no-default-features` leaves out the window, for a headless install.
 
 ## Speculation
 

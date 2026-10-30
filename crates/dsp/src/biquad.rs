@@ -85,6 +85,23 @@ impl Coeffs {
         }
     }
 
+    /// Band-pass with 0 dB gain at `freq_hz`. Used to pick out one band of a
+    /// signal, such as the sibilance a de-esser watches.
+    pub fn band_pass(sample_rate: f32, freq_hz: f32, q: f32) -> Coeffs {
+        let fs = sample_rate as f64;
+        let w0 = 2.0 * PI * (freq_hz as f64).clamp(1.0, fs * 0.49) / fs;
+        let (sin, cos) = w0.sin_cos();
+        let alpha = sin / (2.0 * (q as f64).max(0.01));
+        let a0 = 1.0 + alpha;
+        Coeffs {
+            b0: alpha / a0,
+            b1: 0.0,
+            b2: -alpha / a0,
+            a1: -2.0 * cos / a0,
+            a2: (1.0 - alpha) / a0,
+        }
+    }
+
     /// Magnitude response in dB at `freq_hz`. Used by tests and for sanity
     /// checks; not called on the audio thread.
     pub fn magnitude_db(&self, sample_rate: f32, freq_hz: f32) -> f64 {
@@ -177,6 +194,13 @@ mod tests {
         let high = Coeffs::new(BandKind::HighShelf, FS, 6000.0, 0.707, -3.0);
         assert!((high.magnitude_db(FS, 20_000.0) + 3.0).abs() < 0.2);
         assert!(high.magnitude_db(FS, 100.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn band_pass_passes_its_center_only() {
+        let c = Coeffs::band_pass(FS, 6500.0, 1.4);
+        assert!(c.magnitude_db(FS, 6500.0).abs() < 0.01);
+        assert!(c.magnitude_db(FS, 300.0) < -20.0);
     }
 
     #[test]

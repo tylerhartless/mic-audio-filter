@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Mic Filter
+GenericName=Microphone Settings
+Comment=Choose your mic and tune its EQ, compression and noise removal
+Exec=@BIN@ gui
+Icon=audio-input-microphone
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=microphone;mic;eq;equalizer;noise;compressor;pipewire;
+StartupWMClass=mic-filter

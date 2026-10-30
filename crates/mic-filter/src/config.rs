@@ -3,8 +3,8 @@
 
 use anyhow::{bail, Context, Result};
 use mic_filter_dsp::{
-    ChainSettings, CompressorSettings, DenoiseSettings, EqSettings, GainSettings, HighpassSettings,
-    LimiterSettings, SAMPLE_RATE,
+    ChainSettings, CompressorSettings, DeEsserSettings, DenoiseSettings, EqSettings, GainSettings,
+    HighpassSettings, LimiterSettings, SAMPLE_RATE,
 };
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ pub struct Config {
     pub denoise: DenoiseSettings,
     pub eq: EqSettings,
     pub compressor: CompressorSettings,
+    pub deesser: DeEsserSettings,
     pub limiter: LimiterSettings,
 }
 
@@ -75,6 +76,7 @@ impl Config {
             denoise: self.denoise.clone(),
             eq: self.eq.clone(),
             compressor: self.compressor.clone(),
+            deesser: self.deesser.clone(),
             limiter: self.limiter.clone(),
         }
     }
@@ -117,12 +119,127 @@ pub fn set_input_device(path: &Path, device: &str) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => template(Some(device)),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    // Never write a file that the running instance would then reject.
-    Config::parse(&text).with_context(|| format!("in {}", path.display()))?;
+    write_checked(path, &text).map(drop)
+}
+
+/// Writes every setting in `config` to the file, changing only the values
+/// that differ so the file's comments and layout survive. Creates the file
+/// from the template if it doesn't exist.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+pub fn save(path: &Path, config: &Config) -> Result<()> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => template(Some(&config.input.device)),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let text = merged(&existing, config).with_context(|| format!("in {}", path.display()))?;
+    if write_checked(path, &text)? != *config {
+        bail!("saved config did not read back the same; please report this");
+    }
+    Ok(())
+}
+
+/// Validates `text`, then replaces the file atomically, so the running
+/// service never reads a half-written or invalid config.
+fn write_checked(path: &Path, text: &str) -> Result<Config> {
+    let config = Config::parse(text).with_context(|| format!("in {}", path.display()))?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, text).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+    Ok(config)
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn merged(existing: &str, config: &Config) -> Result<String> {
+    let mut doc: toml_edit::DocumentMut = existing.parse()?;
+    let fresh: toml_edit::DocumentMut = toml::to_string(config)?.parse()?;
+    merge_table(doc.as_table_mut(), fresh.as_table());
+    Ok(doc.to_string())
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn merge_table(dst: &mut dyn toml_edit::TableLike, src: &dyn toml_edit::TableLike) {
+    use toml_edit::{Item, Value};
+    for (key, new) in src.iter() {
+        // serde writes lists of structs as [[tables]]; the config file keeps
+        // them as an inline list, like the template.
+        let new = match new {
+            Item::ArrayOfTables(tables) => Item::Value(Value::Array(inline_array(tables))),
+            other => other.clone(),
+        };
+        match dst.get_mut(key) {
+            Some(old) if old.is_table_like() && new.is_table_like() => merge_table(
+                old.as_table_like_mut().unwrap(),
+                new.as_table_like().unwrap(),
+            ),
+            Some(Item::Value(old)) => {
+                if let Item::Value(new) = new {
+                    replace_value(old, new);
+                }
+            }
+            Some(old) => *old = new,
+            None => {
+                dst.insert(key, new);
+            }
+        }
+    }
+}
+
+/// Swaps in `new` unless it's equal to `old`, keeping the comments around
+/// the old value.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn replace_value(old: &mut toml_edit::Value, mut new: toml_edit::Value) {
+    if normalized(old) == normalized(&new) {
+        return;
+    }
+    if let (Some(old_array), Some(new_array)) = (old.as_array(), new.as_array_mut()) {
+        // Keep commented-out entries written after the last item.
+        let trailing = old_array.trailing().as_str().unwrap_or("\n").to_string();
+        new_array.set_trailing(if trailing.contains('\n') {
+            trailing
+        } else {
+            "\n".into()
+        });
+    }
+    *new.decor_mut() = old.decor().clone();
+    *old = new;
+}
+
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn normalized(value: &toml_edit::Value) -> String {
+    let mut value = value.clone();
+    value.decor_mut().clear();
+    if let Some(array) = value.as_array_mut() {
+        array.fmt();
+        array.iter_mut().for_each(|v| {
+            if let Some(t) = v.as_inline_table_mut() {
+                t.fmt();
+            }
+        });
+    }
+    value.to_string()
+}
+
+/// One inline table per line, matching the template's layout.
+#[cfg_attr(not(feature = "gui"), allow(dead_code))]
+fn inline_array(tables: &toml_edit::ArrayOfTables) -> toml_edit::Array {
+    let mut array: toml_edit::Array = tables
+        .iter()
+        .map(|t| {
+            let mut inline = t.clone().into_inline_table();
+            inline.fmt();
+            toml_edit::Value::InlineTable(inline)
+        })
+        .collect();
+    for item in array.iter_mut() {
+        item.decor_mut().set_prefix("\n    ");
+    }
+    array.set_trailing_comma(true);
+    array.set_trailing("\n");
+    array
 }
 
 fn with_input_device(text: &str, device: &str) -> Result<String> {
@@ -155,7 +272,7 @@ pub fn template(device: Option<&str>) -> String {
 
 const TEMPLATE: &str = r#"# mic-filter config. Edits apply live while mic-filter is running,
 # except [output], which needs a restart.
-# Signal chain: gain -> highpass -> denoise -> eq -> compressor -> output gain -> limiter
+# Signal chain: gain -> highpass -> denoise -> eq -> compressor -> deesser -> output gain -> limiter
 
 [input]
 # The mic to process. Switch it with `mic-filter use`, or paste a name from
@@ -212,6 +329,14 @@ knee_db = 6.0
 attack_ms = 5.0
 release_ms = 150.0
 makeup_db = 6.0
+
+[deesser]
+# Turns down harsh "s" and "sh" sounds. The band around freq_hz is cut,
+# only while it's louder than threshold_db.
+enabled = false
+freq_hz = 6500.0
+threshold_db = -34.0
+max_reduction_db = 9.0
 
 [limiter]
 # Safety net so nothing ever clips.
@@ -274,6 +399,87 @@ mod tests {
         let c = Config::parse(&after).unwrap();
         assert_eq!(c.input.target(), Some("alsa_input.x"));
         assert_eq!(c.gain.input_db, 6.0);
+    }
+
+    fn changed_lines(a: &str, b: &str) -> Vec<String> {
+        a.lines()
+            .zip(b.lines())
+            .filter(|(x, y)| x != y)
+            .map(|(_, y)| y.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn saving_unchanged_config_is_a_no_op() {
+        let text = template(Some("alsa_input.a"));
+        let config = Config::parse(&text).unwrap();
+        assert_eq!(merged(&text, &config).unwrap(), text);
+    }
+
+    #[test]
+    fn saving_changes_only_edited_lines() {
+        let text = template(Some("alsa_input.a"));
+        let mut config = Config::parse(&text).unwrap();
+        config.compressor.ratio = 4.5;
+        config.denoise.strength = 0.85;
+        let after = merged(&text, &config).unwrap();
+        assert_eq!(text.lines().count(), after.lines().count());
+        assert_eq!(
+            changed_lines(&text, &after),
+            ["strength = 0.85", "ratio = 4.5"]
+        );
+    }
+
+    #[test]
+    fn saving_new_bands_keeps_commented_examples() {
+        let text = template(Some("alsa_input.a"));
+        let mut config = Config::parse(&text).unwrap();
+        config.eq.bands[1].gain_db = 3.5;
+        config.eq.bands.push(mic_filter_dsp::EqBand {
+            kind: mic_filter_dsp::BandKind::HighShelf,
+            freq_hz: 9000.0,
+            gain_db: 2.0,
+            q: 0.7,
+        });
+        let after = merged(&text, &config).unwrap();
+        assert_eq!(Config::parse(&after).unwrap(), config);
+        assert!(
+            after.contains(
+                "    { type = \"peaking\", freq_hz = 3000.0, gain_db = 3.5, q = 1.0 },\n"
+            ),
+            "{after}"
+        );
+        assert!(
+            after.contains(
+                "    { type = \"high_shelf\", freq_hz = 9000.0, gain_db = 2.0, q = 0.7 },\n"
+            ),
+            "{after}"
+        );
+        assert!(
+            after.contains("# { type = \"notch\", freq_hz = 60.0, q = 10.0 },   # mains hum\n]"),
+            "{after}"
+        );
+        assert!(after.contains("# mic-filter config."), "top comment lost");
+    }
+
+    #[test]
+    fn saving_fills_in_a_sparse_file() {
+        let mut config = Config::parse("[gain]\ninput_db = 6.0\n").unwrap();
+        config.limiter.ceiling_db = -2.0;
+        let after = merged("[gain]\ninput_db = 6.0\n", &config).unwrap();
+        assert_eq!(Config::parse(&after).unwrap(), config);
+    }
+
+    #[test]
+    fn save_writes_file_that_loads_back() {
+        let dir = std::env::temp_dir().join(format!("mic-filter-save-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let mut config = Config::default();
+        config.gain.input_db = 9.5;
+        save(&path, &config).unwrap();
+        assert_eq!(Config::load(&path).unwrap(), config);
+        assert!(!path.with_extension("toml.tmp").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

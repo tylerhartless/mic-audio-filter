@@ -1,10 +1,11 @@
 //! The full voice chain:
-//! input gain -> high-pass -> RNNoise -> EQ -> compressor -> output gain -> limiter.
+//! input gain -> high-pass -> RNNoise -> EQ -> compressor -> de-esser -> output gain -> limiter.
 //!
 //! [`ChainParams`] is computed off the audio thread from [`ChainSettings`] and
 //! is `Copy`, so handing a new one to [`Chain::set_params`] never allocates.
 
 use crate::biquad::{Biquad, Coeffs};
+use crate::deesser::{DeEsser, DeEsserParams};
 use crate::denoise::{DenoiseParams, Denoiser};
 use crate::dynamics::{
     db_to_lin, lin_to_db, Compressor, CompressorParams, Limiter, LimiterParams, SmoothedGain,
@@ -27,6 +28,7 @@ pub struct ChainParams {
     eq: [Coeffs; MAX_EQ_BANDS],
     eq_len: usize,
     compressor: CompressorParams,
+    deesser: DeEsserParams,
     limiter: LimiterParams,
 }
 
@@ -58,6 +60,7 @@ impl ChainParams {
             eq,
             eq_len,
             compressor: CompressorParams::new(&s.compressor, FS),
+            deesser: DeEsserParams::new(&s.deesser, FS),
             limiter: LimiterParams::new(&s.limiter, FS),
         }
     }
@@ -113,6 +116,7 @@ pub struct Chain {
     denoiser: Denoiser,
     eq: [Biquad; MAX_EQ_BANDS],
     compressor: Compressor,
+    deesser: DeEsser,
     limiter: Limiter,
     meters: Arc<Meters>,
 }
@@ -128,6 +132,7 @@ impl Chain {
             denoiser: Denoiser::new(),
             eq: [Biquad::default(); MAX_EQ_BANDS],
             compressor: Compressor::default(),
+            deesser: DeEsser::default(),
             limiter: Limiter::default(),
             meters,
         };
@@ -155,6 +160,10 @@ impl Chain {
         if !p.compressor.enabled {
             self.compressor.reset();
         }
+        if !p.deesser.enabled {
+            self.deesser.reset();
+        }
+        self.deesser.configure(&p.deesser);
         self.input_gain.set_target(p.input_gain);
         self.output_gain.set_target(p.output_gain);
         self.params = p;
@@ -198,6 +207,9 @@ impl Chain {
                 x = self.compressor.process(&p.compressor, x);
                 reduction = reduction.max(self.compressor.reduction_db());
             }
+            if p.deesser.enabled {
+                x = self.deesser.process(&p.deesser, x);
+            }
             x *= self.output_gain.tick();
             if p.limiter.enabled {
                 x = self.limiter.process(&p.limiter, x);
@@ -227,6 +239,7 @@ impl Chain {
         self.eq.iter_mut().for_each(Biquad::reset);
         self.denoiser.reset();
         self.compressor.reset();
+        self.deesser.reset();
         self.limiter.reset();
     }
 }
@@ -309,6 +322,20 @@ mod tests {
         chain.process(&mut buf);
         let peak = buf[24_000..].iter().fold(0.0f32, |m, x| m.max(x.abs()));
         assert!((lin_to_db(peak) - (lin_to_db(0.5) - 6.0)).abs() < 0.1);
+    }
+
+    #[test]
+    fn deesser_cuts_sibilance_in_the_chain() {
+        let mut s = bypass();
+        s.deesser.enabled = true;
+        let peak_after = |freq: f32| {
+            let mut chain = Chain::new(ChainParams::new(&s), Arc::default());
+            let mut buf = sine(48_000, freq, 0.3);
+            chain.process(&mut buf);
+            lin_to_db(buf[24_000..].iter().fold(0.0f32, |m, x| m.max(x.abs())))
+        };
+        assert!(peak_after(6500.0) < lin_to_db(0.3) - 6.0);
+        assert!((peak_after(300.0) - lin_to_db(0.3)).abs() < 0.3);
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub struct ChainSettings {
     pub denoise: DenoiseSettings,
     pub eq: EqSettings,
     pub compressor: CompressorSettings,
+    pub deesser: DeEsserSettings,
     pub limiter: LimiterSettings,
 }
 
@@ -155,6 +156,30 @@ pub struct LimiterSettings {
     pub release_ms: f32,
 }
 
+/// Turns down harsh "s" and "sh" sounds: a band around `freq_hz` is cut,
+/// only while it's louder than `threshold_db`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DeEsserSettings {
+    pub enabled: bool,
+    /// Center of the band to watch. Sibilance sits around 5 to 8 kHz.
+    pub freq_hz: f32,
+    pub threshold_db: f32,
+    /// The most the band is ever turned down.
+    pub max_reduction_db: f32,
+}
+
+impl Default for DeEsserSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            freq_hz: 6500.0,
+            threshold_db: -34.0,
+            max_reduction_db: 9.0,
+        }
+    }
+}
+
 impl Default for LimiterSettings {
     fn default() -> Self {
         Self {
@@ -271,6 +296,26 @@ impl ChainSettings {
         check(
             (0.0..=40.0).contains(&c.makeup_db),
             format!("compressor.makeup_db = {} is outside 0..40", c.makeup_db),
+        );
+
+        let s = &self.deesser;
+        check(
+            (2000.0..=12000.0).contains(&s.freq_hz),
+            format!("deesser.freq_hz = {} is outside 2000..12000", s.freq_hz),
+        );
+        check(
+            (-60.0..=0.0).contains(&s.threshold_db),
+            format!(
+                "deesser.threshold_db = {} is outside -60..0",
+                s.threshold_db
+            ),
+        );
+        check(
+            (0.0..=24.0).contains(&s.max_reduction_db),
+            format!(
+                "deesser.max_reduction_db = {} is outside 0..24",
+                s.max_reduction_db
+            ),
         );
 
         let l = &self.limiter;

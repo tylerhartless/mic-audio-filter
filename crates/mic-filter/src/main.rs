@@ -5,6 +5,10 @@ mod config;
 mod devices;
 #[cfg(target_os = "linux")]
 mod engine;
+#[cfg(all(target_os = "linux", feature = "gui"))]
+mod gui;
+#[cfg(target_os = "linux")]
+mod ipc;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -51,6 +55,9 @@ enum Command {
     },
     /// Validate the config file and exit
     Check,
+    /// Open the window for choosing the mic and tuning the sound
+    #[cfg(feature = "gui")]
+    Gui,
 }
 
 fn main() {
@@ -69,6 +76,8 @@ fn real_main() -> Result<()> {
         Command::List => list(&config_path),
         Command::Use { mic } => use_mic(&config_path, mic),
         Command::Init { device, force } => init(&config_path, device, force),
+        #[cfg(feature = "gui")]
+        Command::Gui => open_gui(config_path),
         Command::Check => {
             config::Config::load(&config_path)?;
             println!("{} is valid", config_path.display());
@@ -219,6 +228,16 @@ fn init(path: &Path, device: Option<String>, force: bool) -> Result<()> {
         .with_context(|| format!("writing {}", path.display()))?;
     println!("wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "gui"))]
+fn open_gui(config_path: PathBuf) -> Result<()> {
+    gui::run(config_path)
+}
+
+#[cfg(all(not(target_os = "linux"), feature = "gui"))]
+fn open_gui(_: PathBuf) -> Result<()> {
+    bail!("only Linux (PipeWire) is supported so far")
 }
 
 #[cfg(not(target_os = "linux"))]

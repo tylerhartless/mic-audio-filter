@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.5.61", features = ["derive"] }
+eframe = { version = "0.37.0", optional = true }
 mic-filter-dsp = { path = "../dsp" }
 rtrb = "0.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
@@ -16,4 +17,11 @@ toml = "1.0.7"
 toml_edit = "0.25.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2.191"
 pipewire = { version = "0.10.1", features = ["v1_0_0"] }
+
+[features]
+default = ["gui"]
+# The `mic-filter gui` window. Build with --no-default-features for a
+# headless install.
+gui = ["dep:eframe"]

@@ -14,6 +14,7 @@
 //!   up, so apps keep it selected and hear a short gap.
 
 use crate::config::{self, Config, InputConfig};
+use crate::ipc::{self, MeterServer, Snapshot};
 use anyhow::{Context, Result};
 use mic_filter_dsp::{Chain, ChainParams, MeterReading, Meters, SAMPLE_RATE};
 use pipewire as pw;
@@ -27,7 +28,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Set while `--meter` has a live line drawn on stderr.
 static METER_LINE: AtomicBool = AtomicBool::new(false);
@@ -171,11 +172,15 @@ pub fn run(opts: Options) -> Result<()> {
         &mut [spa::pod::Pod::from_bytes(&format).unwrap()],
     )?;
 
-    // Config hot-reload and the level meter run on the main loop.
-    let tick = if opts.meter {
-        Duration::from_millis(100)
-    } else {
-        Duration::from_millis(500)
+    // Config hot-reload and the meters run on the main loop. The tick is short
+    // so GUI edits (which arrive as config file writes) feel immediate.
+    let tick = Duration::from_millis(50);
+    let meter_server = match MeterServer::start(ipc::socket_path(&cfg.output.name)) {
+        Ok(server) => Some(server),
+        Err(e) => {
+            status!("GUI meters are off: {e}");
+            None
+        }
     };
     let watcher = RefCell::new(ConfigWatcher::new(
         opts.config_path.clone(),
@@ -202,8 +207,18 @@ pub fn run(opts: Options) -> Result<()> {
                 }
             }
         }
+        let reading = meters.take();
+        if let Some(server) = &meter_server {
+            server.publish(Snapshot {
+                input_db: reading.input_peak_db,
+                output_db: reading.output_peak_db,
+                reduction_db: reading.reduction_db,
+                vad: reading.vad,
+                streaming: streaming.get(),
+            });
+        }
         if opts.meter {
-            print_meter(meters.take(), streaming.get());
+            print_meter(reading, streaming.get());
         }
     });
     timer.update_timer(Some(tick), Some(tick)).into_result()?;
@@ -382,6 +397,7 @@ struct ConfigWatcher {
     path: PathBuf,
     modified: Option<SystemTime>,
     current: Config,
+    last_notice: Option<Instant>,
 }
 
 impl ConfigWatcher {
@@ -391,6 +407,7 @@ impl ConfigWatcher {
             path,
             modified,
             current,
+            last_notice: None,
         }
     }
 
@@ -408,8 +425,14 @@ impl ConfigWatcher {
             Ok(new) => {
                 if new.output != self.current.output {
                     status!("config reloaded; restart mic-filter to apply [output] changes");
-                } else {
+                } else if self
+                    .last_notice
+                    .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
+                {
+                    // Throttled: dragging a GUI slider rewrites the file many
+                    // times a second.
                     status!("config reloaded");
+                    self.last_notice = Some(Instant::now());
                 }
                 let old = std::mem::replace(&mut self.current, new.clone());
                 Some((old, new))
