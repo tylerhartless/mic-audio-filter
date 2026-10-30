@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 # Builds and installs mic-filter for the current user, writes a starter
 # config if there isn't one, adds "Mic Filter" to the app menu, and starts it
-# as a systemd user service.
+# as a systemd user service. On macOS it runs install-macos.sh instead.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+if [ "$(uname -s)" = Darwin ]; then
+    exec scripts/install-macos.sh
+fi
 
 config_home="${XDG_CONFIG_HOME:-$HOME/.config}"
 apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"

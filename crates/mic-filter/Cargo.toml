@@ -17,11 +17,19 @@ toml = "1.0.7"
 toml_edit = "0.25.5"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", optional = true, features = ["pipewire"] }
 libc = "0.2.191"
 pipewire = { version = "0.10.1", features = ["v1_0_0"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cpal = "0.18.2"
+libc = "0.2.191"
 
 [features]
 default = ["gui"]
 # The `mic-filter gui` window. Build with --no-default-features for a
 # headless install.
 gui = ["dep:eframe"]
+# Linux only: run the cpal backend that macOS uses, through PipeWire, to
+# develop it without a Mac. Needs the ALSA headers (libasound2-dev).
+cpal-backend = ["dep:cpal"]

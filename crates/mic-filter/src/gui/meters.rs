@@ -14,6 +14,15 @@ const SPEECH_TARGET_DB: (f32, f32) = (-18.0, -3.0);
 const SPEECH_MEMORY: Duration = Duration::from_secs(3);
 /// The highest unmute level the gate bar's line can be dragged to.
 const GATE_MAX_DB: f32 = -5.0;
+/// How long the mic may send pure silence before the simple view says so.
+const SILENCE_HINT_AFTER: Duration = Duration::from_secs(3);
+/// The meter feed's floor, which digital silence reads as.
+const SILENT_DB: f32 = -119.5;
+
+#[cfg(target_os = "macos")]
+const SILENT_HINT: &str = "Your mic sends pure silence. Check that it isn't muted, and that Mic Filter is allowed under System Settings > Privacy & Security > Microphone.";
+#[cfg(not(target_os = "macos"))]
+const SILENT_HINT: &str = "Your mic sends pure silence. Check that it isn't muted.";
 
 const QUIET: Color32 = Color32::from_rgb(90, 140, 205);
 const GOOD: Color32 = Color32::from_rgb(80, 190, 110);
@@ -34,6 +43,10 @@ pub struct Meters {
     gate_db: f32,
     /// Seconds left to show the gate as open.
     gate_open_left: f32,
+    /// When audio started flowing, and when the mic last sent anything
+    /// other than digital silence.
+    flowing_since: Option<Instant>,
+    last_signal: Option<Instant>,
 }
 
 impl Default for Meters {
@@ -47,6 +60,8 @@ impl Default for Meters {
             last_speech: None,
             gate_db: FLOOR_DB,
             gate_open_left: 0.0,
+            flowing_since: None,
+            last_signal: None,
         }
     }
 }
@@ -74,6 +89,14 @@ impl Meters {
             self.gate_db = self.gate_db.max(r.gate_db);
             if r.gate_open {
                 self.gate_open_left = 0.1;
+            }
+            if !r.streaming {
+                self.flowing_since = None;
+            } else if self.flowing_since.is_none() {
+                self.flowing_since = Some(Instant::now());
+            }
+            if r.input_db > SILENT_DB {
+                self.last_signal = Some(Instant::now());
             }
             let talking = if voice_detection {
                 r.vad > 0.6
@@ -132,6 +155,8 @@ impl Meters {
                 visuals.weak_text_color(),
                 "Waiting for audio from your mic...",
             )
+        } else if self.silent() {
+            (HOT, SILENT_HINT)
         } else if !talked_recently {
             (
                 visuals.weak_text_color(),
@@ -145,6 +170,16 @@ impl Meters {
             (GOOD, "Sounds good.")
         };
         ui.label(egui::RichText::new(text).color(color));
+    }
+
+    /// Audio has flowed for a while, all of it digital silence: the mic is
+    /// muted, or the system won't let mic-filter record.
+    fn silent(&self) -> bool {
+        self.flowing_since
+            .is_some_and(|t| t.elapsed() > SILENCE_HINT_AFTER)
+            && self
+                .last_signal
+                .is_none_or(|t| t.elapsed() > SILENCE_HINT_AFTER)
     }
 
     /// The level the voice gate hears, with its unmute level as a line you
@@ -315,6 +350,25 @@ fn bar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notices_a_silent_mic() {
+        let mut m = Meters::default();
+        let silent = Snapshot {
+            streaming: true,
+            ..Snapshot::default()
+        };
+        m.update(0.0, Some(silent), true);
+        assert!(!m.silent(), "too early to tell");
+        m.flowing_since = Some(Instant::now() - SILENCE_HINT_AFTER * 2);
+        assert!(m.silent());
+        let quiet_room = Snapshot {
+            input_db: -95.0,
+            ..silent
+        };
+        m.update(0.0, Some(quiet_room), true);
+        assert!(!m.silent(), "a quiet mic still has a noise floor");
+    }
 
     #[test]
     fn peaks_jump_up_and_fall_slowly() {

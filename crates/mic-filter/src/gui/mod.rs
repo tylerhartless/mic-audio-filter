@@ -5,6 +5,7 @@
 
 mod eq;
 mod gate;
+mod listen;
 mod meters;
 mod simple;
 
@@ -12,10 +13,8 @@ use crate::config::{self, Config, DEFAULT_DEVICE};
 use crate::{devices, ipc};
 use anyhow::Result;
 use eframe::egui::{self, Color32, RichText};
-use std::io;
-use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -30,6 +29,11 @@ const SIMPLE_SIZE: [f32; 2] = [600.0, 760.0];
 const SIMPLE_MIN: [f32; 2] = [480.0, 560.0];
 const ADVANCED_SIZE: [f32; 2] = [1100.0, 900.0];
 const ADVANCED_MIN: [f32; 2] = [720.0, 600.0];
+
+/// The launchd agent that runs the service on macOS. The install script
+/// writes it.
+#[cfg(target_os = "macos")]
+const LAUNCHD_LABEL: &str = "io.github.tylerhartless.mic-filter";
 
 const OK_COLOR: Color32 = Color32::from_rgb(80, 190, 110);
 const BAD_COLOR: Color32 = Color32::from_rgb(230, 90, 80);
@@ -107,11 +111,7 @@ struct GuiApp {
     meters: meters::Meters,
     last_frame: Instant,
     eq: eq::EqView,
-    /// A silent recorder that keeps the virtual mic, and so the meters,
-    /// running while the window is open.
-    preview: Option<Child>,
-    /// pw-loopback playing the virtual mic into your headphones.
-    monitor: Option<Child>,
+    listen: listen::Listen,
     want_preview: bool,
     want_monitor: bool,
     /// Showing every setting, with the simple controls hidden.
@@ -185,8 +185,7 @@ impl GuiApp {
             meters: meters::Meters::default(),
             last_frame: now,
             eq: eq::EqView::default(),
-            preview: None,
-            monitor: None,
+            listen: listen::Listen::default(),
             want_preview: true,
             want_monitor: false,
             advanced: false,
@@ -289,34 +288,17 @@ impl GuiApp {
     }
 
     fn sync_children(&mut self, connected: bool) {
-        let target = self.config.output.name.clone();
-        let preview_props =
-            "{ node.name = \"mic-filter.gui-preview\" node.description = \"Mic Filter preview\" }";
-        let want_preview = self.want_preview || !self.advanced;
-        let preview = sync_child(&mut self.preview, want_preview && connected, || {
-            spawn(
-                "pw-record",
-                &[
-                    "--target",
-                    &target,
-                    "-P",
-                    preview_props,
-                    "--rate",
-                    "48000",
-                    "--channels",
-                    "1",
-                    "/dev/null",
-                ],
-            )
-        });
-        if let Err(e) = preview {
+        let want_preview = (self.want_preview || !self.advanced) && connected;
+        let problems = self.listen.sync(
+            &self.config.output.name,
+            want_preview,
+            self.want_monitor && connected,
+        );
+        if let Some(e) = problems.preview {
             self.want_preview = false;
             self.set_notice(Notice::error(format!("Live preview stopped: {e}")));
         }
-        let monitor = sync_child(&mut self.monitor, self.want_monitor && connected, || {
-            spawn("pw-loopback", &["-C", &target, "-n", "mic-filter-monitor"])
-        });
-        if let Err(e) = monitor {
+        if let Some(e) = problems.monitor {
             self.want_monitor = false;
             self.set_notice(Notice::error(format!("Hear myself stopped: {e}")));
         }
@@ -332,12 +314,8 @@ impl GuiApp {
                 ui.label(RichText::new("●").color(BAD_COLOR));
                 ui.label("Not running");
                 if ui.button("Start").clicked() {
-                    self.run_command(
-                        &ctx,
-                        "systemctl",
-                        vec!["--user".into(), "start".into(), "mic-filter.service".into()],
-                        "Started the mic-filter service",
-                    );
+                    let (program, args) = start_service_command();
+                    self.run_command(&ctx, program, args, "Started the mic-filter service");
                 }
             }
             ui.separator();
@@ -349,32 +327,48 @@ impl GuiApp {
                     self.refresh_mics(&ctx);
                 }
                 ui.separator();
-                ui.toggle_value(&mut self.want_preview, "Live preview").on_hover_text(
-                    "Keeps the mic running while this window is open, so the meters move even when no app is recording.",
-                );
+                if listen::NEEDS_PREVIEW {
+                    ui.toggle_value(&mut self.want_preview, "Live preview").on_hover_text(
+                        "Keeps the mic running while this window is open, so the meters move even when no app is recording.",
+                    );
+                }
                 ui.toggle_value(&mut self.want_monitor, "Hear myself")
                     .on_hover_text("Plays Mic Filter into your output. Use headphones to avoid feedback.");
             }
             ui.separator();
 
-            let default = self.mics.lock().unwrap().sources.default.clone();
-            if default.as_deref() == Some(self.config.output.name.as_str()) {
-                ui.label(RichText::new("Default mic").color(OK_COLOR))
-                    .on_hover_text("Apps that use the system default mic get Mic Filter.");
-            } else if default.is_some()
-                && ui
-                    .button("Make default mic")
-                    .on_hover_text("Make Mic Filter the system default, so apps use it automatically.")
-                    .clicked()
-            {
-                self.run_command(
-                    &ctx,
-                    "pactl",
-                    vec!["set-default-source".into(), self.config.output.name.clone()],
-                    "Mic Filter is now the default mic",
-                );
-            }
+            self.default_mic_status(ui, &ctx);
         });
+    }
+
+    /// Whether apps get the processed mic without picking it themselves.
+    #[cfg(pipewire_backend)]
+    fn default_mic_status(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let default = self.mics.lock().unwrap().sources.default.clone();
+        if default.as_deref() == Some(self.config.output.name.as_str()) {
+            ui.label(RichText::new("Default mic").color(OK_COLOR))
+                .on_hover_text("Apps that use the system default mic get Mic Filter.");
+        } else if default.is_some()
+            && ui
+                .button("Make default mic")
+                .on_hover_text("Make Mic Filter the system default, so apps use it automatically.")
+                .clicked()
+        {
+            self.run_command(
+                ctx,
+                "pactl",
+                vec!["set-default-source".into(), self.config.output.name.clone()],
+                "Mic Filter is now the default mic",
+            );
+        }
+    }
+
+    /// The default mic has to stay your real mic, which mic-filter may be
+    /// following, so this only names the device apps should pick.
+    #[cfg(cpal_backend)]
+    fn default_mic_status(&mut self, ui: &mut egui::Ui, _ctx: &egui::Context) {
+        ui.label(format!("Apps use: {}", self.config.output.name))
+            .on_hover_text("Pick this as the mic in Discord, Zoom, your browser and other apps.");
     }
 
     fn mic_picker(&mut self, ui: &mut egui::Ui) {
@@ -435,9 +429,11 @@ impl GuiApp {
                 "The mic-filter service isn't running, so nothing is processed. Press Start at the top.",
             );
         } else if !streaming {
-            ui.weak(
-                "Idle: nothing is recording from Mic Filter. Turn on Live preview to see levels.",
-            );
+            ui.weak(if listen::NEEDS_PREVIEW {
+                "Idle: nothing is recording from Mic Filter. Turn on Live preview to see levels."
+            } else {
+                "Waiting for audio from your mic."
+            });
         } else {
             ui.label("Talk normally and aim for the shaded zones.");
         }
@@ -624,9 +620,14 @@ impl GuiApp {
                     self.set_advanced(&ctx, false);
                 }
                 if ui.button("Open config file").clicked() {
+                    let opener = if cfg!(target_os = "macos") {
+                        "open"
+                    } else {
+                        "xdg-open"
+                    };
                     self.run_command(
                         &ctx,
-                        "xdg-open",
+                        opener,
                         vec![self.path.display().to_string()],
                         "Opened the config file",
                     );
@@ -717,12 +718,6 @@ impl Drop for GuiApp {
     fn drop(&mut self) {
         if self.config != self.saved {
             let _ = config::save(&self.path, &self.config);
-        }
-        for child in [self.preview.take(), self.monitor.take()]
-            .into_iter()
-            .flatten()
-        {
-            stop(child);
         }
     }
 }
@@ -1005,52 +1000,20 @@ fn modified_time(path: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Starts a helper process that dies with this window, so a crash can't
-/// leave the mic open.
-fn spawn(program: &str, args: &[&str]) -> io::Result<Child> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: prctl is async-signal-safe, which is all pre_exec requires.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
-    cmd.spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("could not start {program}: {e}")))
+#[cfg(target_os = "macos")]
+fn start_service_command() -> (&'static str, Vec<String>) {
+    // SAFETY: getuid has no preconditions and can't fail.
+    let uid = unsafe { libc::getuid() };
+    (
+        "launchctl",
+        vec!["kickstart".into(), format!("gui/{uid}/{LAUNCHD_LABEL}")],
+    )
 }
 
-fn stop(mut child: Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-/// Starts or stops a helper process to match `want`. Errors if the process
-/// can't start, or exits by itself.
-fn sync_child(
-    slot: &mut Option<Child>,
-    want: bool,
-    start: impl FnOnce() -> io::Result<Child>,
-) -> io::Result<()> {
-    if let Some(child) = slot {
-        let exited: Option<ExitStatus> = child.try_wait()?;
-        if let Some(status) = exited {
-            *slot = None;
-            if want {
-                return Err(io::Error::other(format!(
-                    "the helper process exited ({status})"
-                )));
-            }
-        } else if !want {
-            stop(slot.take().unwrap());
-        }
-    }
-    if want && slot.is_none() {
-        *slot = Some(start()?);
-    }
-    Ok(())
+#[cfg(not(target_os = "macos"))]
+fn start_service_command() -> (&'static str, Vec<String>) {
+    (
+        "systemctl",
+        vec!["--user".into(), "start".into(), "mic-filter.service".into()],
+    )
 }

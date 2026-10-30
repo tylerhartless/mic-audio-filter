@@ -1,0 +1,58 @@
+# Builds and tests the macOS version on a real Mac, and uploads
+# "Mic Filter.app" for Apple Silicon and Intel as a download.
+name: macOS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: |
+          rustup update stable
+          rustup default stable
+          rustup target add x86_64-apple-darwin
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build for Apple Silicon and Intel
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          lipo -create -output mic-filter \
+            target/aarch64-apple-darwin/release/mic-filter \
+            target/x86_64-apple-darwin/release/mic-filter
+
+      # Without this text macOS won't let mic-filter record.
+      - name: Check the embedded Info.plist
+        run: |
+          for arch in arm64 x86_64; do
+            otool -arch "$arch" -l mic-filter | grep -q __info_plist
+          done
+          strings mic-filter | grep -q NSMicrophoneUsageDescription
+
+      - name: Package Mic Filter.app
+        run: |
+          app="dist/Mic Filter.app"
+          mkdir -p "$app/Contents/MacOS"
+          cp mic-filter "$app/Contents/MacOS/"
+          version="$(./mic-filter --version | awk '{ print $2 }')"
+          sed "s|@VERSION@|$version|g" crates/mic-filter/macos/Info.plist > "$app/Contents/Info.plist"
+          codesign --force --sign - "$app"
+          ditto -c -k --keepParent "$app" dist/mic-filter-macos.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mic-filter-macos
+          path: dist/mic-filter-macos.zip

@@ -1,6 +1,7 @@
 //! Live meter feed from the running service to the GUI, over a Unix socket in
-//! `$XDG_RUNTIME_DIR`. The feed is read-only: settings travel through the
-//! config file, which the service already reloads live.
+//! `$XDG_RUNTIME_DIR` (`~/Library/Caches/mic-filter` on macOS). The feed is
+//! read-only: settings travel through the config file, which the service
+//! already reloads live.
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -10,9 +11,16 @@ use std::thread;
 use std::time::Duration;
 
 pub fn socket_path(output_name: &str) -> PathBuf {
-    let dir = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
+    let dir = if cfg!(target_os = "macos") {
+        // A fixed per-user place, so the launchd agent and the window agree
+        // on it without depending on $TMPDIR.
+        PathBuf::from(std::env::var_os("HOME").unwrap_or_default())
+            .join("Library/Caches/mic-filter")
+    } else {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+    };
     dir.join(format!("mic-filter-{output_name}.sock"))
 }
 
@@ -90,6 +98,9 @@ impl MeterServer {
         }
         // Left over from an instance that didn't shut down cleanly.
         let _ = std::fs::remove_file(&path);
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
         let listener = UnixListener::bind(&path)?;
         let latest = Arc::new((Mutex::new((0, Snapshot::default())), Condvar::new()));
 

@@ -1,14 +1,25 @@
 //! mic-filter: one processed virtual mic for every app.
 
+#[cfg(audio_backend)]
+#[macro_use]
+mod service;
+
+#[cfg(any(cpal_backend, test))]
+mod bridge;
 mod config;
-#[cfg(target_os = "linux")]
+#[cfg(cpal_backend)]
+mod cpal_engine;
+#[cfg(audio_backend)]
 mod devices;
-#[cfg(target_os = "linux")]
+#[cfg(pipewire_backend)]
 mod engine;
-#[cfg(all(target_os = "linux", feature = "gui"))]
+#[cfg(all(audio_backend, feature = "gui"))]
 mod gui;
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 mod ipc;
+
+#[cfg(cpal_backend)]
+use cpal_engine as engine;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -71,7 +82,7 @@ fn real_main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.unwrap_or_else(config::default_path);
 
-    match cli.command.unwrap_or(Command::Run { meter: false }) {
+    match cli.command.unwrap_or_else(default_command) {
         Command::Run { meter } => run(config_path, meter),
         Command::List => list(&config_path),
         Command::Use { mic } => use_mic(&config_path, mic),
@@ -86,13 +97,25 @@ fn real_main() -> Result<()> {
     }
 }
 
+/// `run`, except in a macOS app bundle: Finder starts the app with no
+/// arguments, and there the window is what you want.
+fn default_command() -> Command {
+    #[cfg(all(target_os = "macos", feature = "gui"))]
+    if std::env::current_exe()
+        .is_ok_and(|exe| exe.to_string_lossy().contains(".app/Contents/MacOS/"))
+    {
+        return Command::Gui;
+    }
+    Command::Run { meter: false }
+}
+
 /// The config if there is a valid one, otherwise the defaults. Good enough
 /// for commands that only need the device and output names.
 fn config_or_default(path: &Path) -> config::Config {
     config::Config::load(path).unwrap_or_default()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn run(config_path: PathBuf, meter: bool) -> Result<()> {
     let config = if config_path.exists() {
         config::Config::load(&config_path)?
@@ -103,7 +126,7 @@ fn run(config_path: PathBuf, meter: bool) -> Result<()> {
         );
         config::Config::default()
     };
-    engine::run(engine::Options {
+    engine::run(service::Options {
         config_path,
         config,
         meter,
@@ -111,12 +134,12 @@ fn run(config_path: PathBuf, meter: bool) -> Result<()> {
 }
 
 /// Every mic except mic-filter's own output.
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn selectable_mics(config: &config::Config) -> Result<devices::Sources> {
     Ok(devices::query()?.without(&config.output.name))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn print_mics(mics: &devices::Sources, config: &config::Config) {
     let in_use = config.input.target();
     if mics.list.is_empty() {
@@ -147,7 +170,7 @@ fn print_mics(mics: &devices::Sources, config: &config::Config) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn list(config_path: &Path) -> Result<()> {
     let config = config_or_default(config_path);
     print_mics(&selectable_mics(&config)?, &config);
@@ -155,7 +178,7 @@ fn list(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn use_mic(config_path: &Path, choice: Option<String>) -> Result<()> {
     use std::io::{IsTerminal, Write};
 
@@ -196,7 +219,7 @@ fn use_mic(config_path: &Path, choice: Option<String>) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(audio_backend)]
 fn init(path: &Path, device: Option<String>, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!(
@@ -230,32 +253,32 @@ fn init(path: &Path, device: Option<String>, force: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(all(target_os = "linux", feature = "gui"))]
+#[cfg(all(audio_backend, feature = "gui"))]
 fn open_gui(config_path: PathBuf) -> Result<()> {
     gui::run(config_path)
 }
 
-#[cfg(all(not(target_os = "linux"), feature = "gui"))]
+#[cfg(all(not(audio_backend), feature = "gui"))]
 fn open_gui(_: PathBuf) -> Result<()> {
-    bail!("only Linux (PipeWire) is supported so far")
+    bail!("only Linux and macOS are supported so far")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(audio_backend))]
 fn run(_: PathBuf, _: bool) -> Result<()> {
-    bail!("only Linux (PipeWire) is supported so far")
+    bail!("only Linux and macOS are supported so far")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(audio_backend))]
 fn list(_: &Path) -> Result<()> {
-    bail!("only Linux (PipeWire) is supported so far")
+    bail!("only Linux and macOS are supported so far")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(audio_backend))]
 fn use_mic(_: &Path, _: Option<String>) -> Result<()> {
-    bail!("only Linux (PipeWire) is supported so far")
+    bail!("only Linux and macOS are supported so far")
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(audio_backend))]
 fn init(path: &Path, _device: Option<String>, force: bool) -> Result<()> {
     if path.exists() && !force {
         bail!(

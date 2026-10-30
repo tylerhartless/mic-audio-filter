@@ -1,29 +1,44 @@
-//! One-shot query of PipeWire for the available mics and the default one.
+//! The available mics and the default one, and turning what the user typed
+//! into one of them. Each backend provides `query`.
 
 use crate::config::DEFAULT_DEVICE;
 use anyhow::{bail, Result};
+#[cfg(pipewire_backend)]
 use pipewire as pw;
+#[cfg(pipewire_backend)]
 use pw::metadata::{Metadata, MetadataListener};
+#[cfg(pipewire_backend)]
 use pw::types::ObjectType;
+#[cfg(pipewire_backend)]
 use std::cell::{Cell, RefCell};
+#[cfg(pipewire_backend)]
 use std::rc::Rc;
+
+#[cfg(cpal_backend)]
+pub use crate::cpal_engine::query;
 
 #[derive(Debug, Clone)]
 pub struct Source {
+    /// A stable id: the PipeWire node.name, or the CoreAudio device UID.
     pub name: String,
     pub description: String,
-    /// Backed by a real device (ALSA, Bluetooth...). Virtual nodes are false.
+    /// Backed by a real device (USB, Bluetooth, built-in...). Virtual
+    /// devices are false.
     pub hardware: bool,
 }
 
 impl Source {
-    /// How likely this is the mic you talk into. Registry globals don't carry
-    /// the device form factor, so this goes by name: headsets are usually USB
-    /// or Bluetooth, and webcam mics are usually the worst choice.
+    /// How likely this is the mic you talk into. Neither PipeWire nor
+    /// CoreAudio says what form a device takes, so this goes by name:
+    /// headsets are usually USB or Bluetooth, and webcam mics are usually the
+    /// worst choice.
     fn voice_score(&self) -> i32 {
         let text = format!("{} {}", self.name, self.description).to_lowercase();
         let mut score = 0;
-        if text.contains(".usb-") || text.starts_with("bluez_input") {
+        if ["usb", "bluez_input", "headset", "airpods"]
+            .iter()
+            .any(|word| text.contains(word))
+        {
             score += 2;
         }
         if text.contains("camera") || text.contains("webcam") {
@@ -41,6 +56,15 @@ pub struct Sources {
 }
 
 impl Sources {
+    /// Real mics first, the likeliest voice mics first among them.
+    pub fn sort(&mut self) {
+        self.list.sort_by(|a, b| {
+            b.hardware
+                .cmp(&a.hardware)
+                .then(b.voice_score().cmp(&a.voice_score()))
+        });
+    }
+
     /// The mic `init` should pick: the default if it's real hardware,
     /// otherwise the hardware mic that looks most like a headset.
     pub fn best_hardware(&self) -> Option<&Source> {
@@ -56,10 +80,12 @@ impl Sources {
         })
     }
 
-    /// Drops the virtual mic that mic-filter publishes, which can't be its
-    /// own input.
+    /// Drops the device mic-filter writes to, which can't be its own input.
+    /// `own_output` is the `[output] name`: a PipeWire node.name on Linux, a
+    /// device name or UID on macOS.
     pub fn without(mut self, own_output: &str) -> Self {
-        self.list.retain(|s| s.name != own_output);
+        self.list
+            .retain(|s| s.name != own_output && s.description != own_output);
         self
     }
 
@@ -111,6 +137,7 @@ impl Sources {
     }
 }
 
+#[cfg(pipewire_backend)]
 pub fn query() -> Result<Sources> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -188,15 +215,12 @@ pub fn query() -> Result<Sources> {
 
     drop(metadata);
     let mut sources = sources.take();
-    sources.list.sort_by(|a, b| {
-        b.hardware
-            .cmp(&a.hardware)
-            .then(b.voice_score().cmp(&a.voice_score()))
-    });
+    sources.sort();
     Ok(sources)
 }
 
 /// Pulls "name" out of a metadata value like `{ "name": "alsa_input.foo" }`.
+#[cfg(pipewire_backend)]
 fn json_name(value: &str) -> Option<String> {
     let after_key = &value[value.find("\"name\"")? + 6..];
     let start = after_key.find('"')? + 1;
@@ -333,6 +357,7 @@ mod tests {
         );
     }
 
+    #[cfg(pipewire_backend)]
     #[test]
     fn parses_default_source_metadata() {
         assert_eq!(

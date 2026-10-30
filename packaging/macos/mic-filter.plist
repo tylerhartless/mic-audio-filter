@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- launchd agent that runs mic-filter at login. scripts/install-macos.sh
+     fills in @BIN@ and @LOG@ and installs it to ~/Library/LaunchAgents. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>io.github.tylerhartless.mic-filter</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@BIN@</string>
+        <string>run</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- Restart after a crash, but not after a clean stop. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>2</integer>
+    <!-- Audio needs the scheduling launchd gives interactive apps. -->
+    <key>ProcessType</key>
+    <string>Interactive</string>
+    <key>StandardErrorPath</key>
+    <string>@LOG@</string>
+</dict>
+</plist>

@@ -1,26 +1,30 @@
 # mic-filter
 
-mic-filter processes your microphone once for every app. It reads any mic you choose, runs it through gain, a high-pass filter, RNNoise noise suppression, EQ, a compressor, a de-esser and a limiter, and publishes the result as a virtual mic named **Mic Filter**. Every app that selects Mic Filter hears the same processed voice, so per-app noise suppression and auto gain can stay off.
+mic-filter processes your microphone once for every app. It reads any mic you choose, runs it through gain, a high-pass filter, RNNoise noise suppression, EQ, a compressor, a de-esser and a limiter, and passes the result to a virtual mic. On Linux mic-filter creates that mic itself, named **Mic Filter**. On macOS it plays into [BlackHole](https://github.com/ExistentialAudio/BlackHole), a free virtual audio device that apps list as **BlackHole 2ch**. Every app that selects the virtual mic hears the same processed voice, so per-app noise suppression and auto gain can stay off.
 
-Linux with PipeWire is supported today. macOS and Windows are planned.[*](#speculation)
+mic-filter runs on Linux with PipeWire and on macOS 11 or newer. The macOS version is new and hasn't run on a Mac yet.[*](#speculation) Windows is planned.
 
 ## How it works
 
 ```
-real mic --> mic-filter --> "Mic Filter" virtual mic --> Discord, Zoom, OBS, browsers, ...
+Linux: real mic --> mic-filter --> "Mic Filter" virtual mic --> Discord, Zoom, OBS, browsers, ...
+macOS: real mic --> mic-filter --> BlackHole 2ch ----------> Discord, Zoom, OBS, browsers, ...
 
 inside mic-filter:
   input gain -> high-pass -> RNNoise -> EQ -> compressor -> de-esser -> output gain -> limiter
 ```
 
 - mic-filter is a separate process. If it crashes, PipeWire and the rest of your audio keep running.
-- The real mic only runs while an app is recording from Mic Filter. With no app recording, mic-filter uses no CPU.
+- On Linux, the real mic only runs while an app is recording from Mic Filter. With no app recording, mic-filter uses no CPU. On macOS, nothing tells mic-filter whether an app is recording from BlackHole, so the mic stays open while mic-filter runs and the orange mic indicator stays on.
 - Processing runs inside the same PipeWire cycle that captures the audio. The added delay is 20 ms with noise suppression on (RNNoise works in 10 ms frames and lags one frame) and 0 ms with it off.
 - On the development machine the chain takes about 18 microseconds per 5.3 ms audio cycle, which is about 0.3% of one CPU core.
 - Config edits apply live while it runs, including switching to a different mic. An invalid edit is rejected with an error and the previous settings stay in effect.
-- The capture side and the virtual mic share a PipeWire link group. WirePlumber refuses to link a node to its own link group, so mic-filter can never record its own output, even when Mic Filter is the system default.
+- The capture side and the virtual mic share a PipeWire link group. WirePlumber refuses to link a node to its own link group, so mic-filter can never record its own output, even when Mic Filter is the system default. On macOS, mic-filter skips BlackHole when it picks a mic.
+- On macOS, the mic and BlackHole each run on their own clock, and no two clocks agree exactly. mic-filter resamples from the mic's rate to 48 kHz and adjusts the ratio by up to 0.5% to keep a steady buffer of one mic callback plus 2 ms between them. A change that small is inaudible, and the buffer neither grows nor runs dry.
 
 ## Requirements
+
+### Linux
 
 - Linux with PipeWire 1.0 or newer and WirePlumber.
 - Rust 1.95 or newer. Install it with [rustup](https://rustup.rs).
@@ -32,7 +36,16 @@ inside mic-filter:
   | Fedora | `sudo dnf install pipewire-devel clang` |
   | Arch | `sudo pacman -S pipewire clang` |
 
+### macOS
+
+- macOS 11 or newer, on Apple Silicon or Intel.
+- BlackHole 2ch: `brew install blackhole-2ch`, or the installer from [existential.audio](https://existential.audio/blackhole/).
+- Rust 1.95 or newer. Install it with [rustup](https://rustup.rs).
+- The Xcode command line tools: `xcode-select --install`.
+
 ## Install
+
+### Linux
 
 ```bash
 git clone https://github.com/tylerhartless/mic-audio-filter.git
@@ -52,6 +65,30 @@ Then pick **Mic Filter** as the input in each app, or make it the system default
 ```bash
 pactl set-default-source mic_filter
 ```
+
+### macOS
+
+```bash
+brew install blackhole-2ch
+git clone https://github.com/tylerhartless/mic-audio-filter.git
+cd mic-audio-filter
+./scripts/install.sh
+```
+
+On a Mac, the script:
+
+1. Checks that BlackHole is installed.
+2. Builds mic-filter, installs it to `~/.cargo/bin/mic-filter`, and copies it into `~/Applications/Mic Filter.app`.
+3. Writes `~/.config/mic-filter/config.toml` if no config exists yet, picking the starting mic the same way as on Linux.
+4. Installs and starts a launchd agent, `~/Library/LaunchAgents/io.github.tylerhartless.mic-filter.plist`, which runs mic-filter at login.
+
+macOS asks once whether Mic Filter may use the microphone. Allow it. If it doesn't ask, and the Mic Filter window says your mic sends pure silence, turn on Mic Filter under System Settings > Privacy & Security > Microphone.
+
+Then pick **BlackHole 2ch** as the mic in each app. You can also make it the system input under System Settings > Sound > Input. When mic-filter follows the system default and the default is BlackHole, it uses the mic that looks most like a headset instead, so it never records itself.
+
+Each push to `main` also builds `Mic Filter.app` for Apple Silicon and Intel on GitHub's Mac runners, under the **macOS** workflow's artifacts. That build carries no developer signature, so macOS blocks it until you remove the download flag with `xattr -dr com.apple.quarantine "Mic Filter.app"`. The install script is the supported way to install.
+
+### Both
 
 In apps that have their own processing (Discord, Zoom, Teams, browsers), turn off noise suppression and automatic gain control so they don't fight mic-filter.
 
@@ -78,6 +115,8 @@ mic-filter use default   # follow the system default mic
   d. Follow the system default mic
 ```
 
+On macOS the second line of each entry is the device's CoreAudio UID.
+
 The choice is saved as `[input] device` in the config. A running mic-filter switches within a second. The virtual mic stays up during the switch, so apps that have Mic Filter selected keep it and hear a short gap.
 
 When the chosen mic is unplugged, PipeWire moves the capture to another available mic, or leaves it waiting when there is none. When the mic is plugged back in, mic-filter captures from it again.[*](#speculation)
@@ -100,7 +139,7 @@ Every command takes `--config <path>` to use a config other than `~/.config/mic-
 
 ## Tuning
 
-Open **Mic Filter** from the app menu, or run `mic-filter gui`.
+Open **Mic Filter** from the app menu (on macOS, from `~/Applications`), or run `mic-filter gui`.
 
 ![The Mic Filter window](docs/gui.png)
 
@@ -121,7 +160,7 @@ Every change saves and applies right away.
 - **Equalizer:** the curve is the combined response of the high-pass and every EQ band. Drag a dot to move a band, scroll over it to change its width (Q), double-click the curve to add a band, and right-click a dot to remove it. The row under the curve edits the selected band's type, frequency, gain and Q.
 - **Input, Noise removal, Compressor, De-esser, Output:** every other setting, with a hint under each card.
 - **Levels:** four live meters. The shaded zones are the targets while you talk.
-- **Live preview** keeps the mic running while the window is open, so the meters move even when no app is recording.
+- **Live preview** (Linux) keeps the mic running while the window is open, so the meters move even when no app is recording. On macOS the mic always runs, so there is no switch for it.
 
 The four simple controls are presets for these settings. A setting changed by hand here shows as **Custom** in the simple view until you pick a level again.
 
@@ -145,7 +184,7 @@ Common adjustments:
 
 ### From the terminal
 
-The service and a manual `run` would both create a Mic Filter node, so stop the service first:
+The service and a manual `run` would both create a Mic Filter node, so stop the service first (on macOS, `launchctl bootout gui/$(id -u)/io.github.tylerhartless.mic-filter`):
 
 ```bash
 systemctl --user stop mic-filter
@@ -158,7 +197,7 @@ Record from Mic Filter in any app and talk normally. The meter line shows the sa
 in  -16.2 dB [#############       ]  out  -6.8 dB [##################  ]  comp -5.1 dB  voice  97%
 ```
 
-Edit `~/.config/mic-filter/config.toml` in another window and save. When you're done, press Ctrl+C and run `systemctl --user start mic-filter`.
+Edit `~/.config/mic-filter/config.toml` in another window and save. When you're done, press Ctrl+C and run `systemctl --user start mic-filter` (on macOS, run `./scripts/install.sh` again, or log out and back in).
 
 ## Configuration
 
@@ -166,8 +205,8 @@ Edit `~/.config/mic-filter/config.toml` in another window and save. When you're 
 
 | Section | Purpose | Live reload |
 | --- | --- | --- |
-| `[input]` | `device`: the mic's node name, or `"default"`. `mic-filter use` sets it for you. | Yes |
-| `[output]` | `name` and `description` of the virtual mic. | Restart needed |
+| `[input]` | `device`: the mic's node name on Linux or UID on macOS, or `"default"`. `mic-filter use` sets it for you. | Yes |
+| `[output]` | Linux: `name` and `description` of the virtual mic. macOS: `name` of the device to play into, `"BlackHole 2ch"` by default. | Restart needed |
 | `[gain]` | `input_db` boost before processing, `output_db` trim before the limiter. | Yes |
 | `[highpass]` | Removes rumble below `freq_hz`. | Yes |
 | `[denoise]` | RNNoise suppression with `strength`, plus the optional voice gate. The gate opens for sounds RNNoise rates as a voice (`vad_threshold`) that also peak above `gate_level_db`. | Yes |
@@ -180,6 +219,8 @@ Unknown keys and out-of-range values are errors, so mic-filter reports typos.
 
 ## Service
 
+### Linux
+
 ```bash
 systemctl --user status mic-filter     # is it running?
 systemctl --user restart mic-filter    # apply [output] changes
@@ -189,6 +230,18 @@ systemctl --user disable --now mic-filter
 
 If PipeWire restarts, mic-filter exits and systemd starts it again against the new PipeWire.
 
+### macOS
+
+```bash
+launchctl print gui/$(id -u)/io.github.tylerhartless.mic-filter        # is it running?
+launchctl kickstart -k gui/$(id -u)/io.github.tylerhartless.mic-filter  # apply [output] changes
+tail -f ~/Library/Logs/mic-filter.log                                  # logs
+launchctl bootout gui/$(id -u)/io.github.tylerhartless.mic-filter       # stop until next login
+rm ~/Library/LaunchAgents/io.github.tylerhartless.mic-filter.plist      # don't start at login
+```
+
+When a mic is unplugged, mic-filter switches to the system default mic, and back once the chosen mic returns. When BlackHole is missing, it logs the problem and checks again every second.
+
 ## Troubleshooting
 
 - **Mic Filter is missing from apps:** check `systemctl --user status mic-filter` and the journal.
@@ -196,15 +249,20 @@ If PipeWire restarts, mic-filter exits and systemd starts it again against the n
 - **`capture error: no target node available` in the log:** no usable mic is connected. PipeWire skips inputs with nothing plugged into them, such as an empty analog jack. Capture resumes once a mic appears.
 - **Another filter records from Mic Filter:** a filter whose own mic is unplugged, such as a PipeWire filter-chain with a `target.object`, can fall back to recording from Mic Filter. WirePlumber then refuses to let mic-filter use that filter as its input because it would form a loop, and mic-filter logs `no target node available`. Point mic-filter at the real mic, or remove the other filter.
 - **Echo of other people:** mic-filter has no echo cancellation. Use headphones.
+- **macOS: apps hear silence from BlackHole 2ch:** open Mic Filter. If it says your mic sends pure silence, turn on Mic Filter under System Settings > Privacy & Security > Microphone, then restart it with `launchctl kickstart -k gui/$(id -u)/io.github.tylerhartless.mic-filter`. If the window says mic-filter isn't running, read `~/Library/Logs/mic-filter.log`.
+- **macOS: apps hear your computer's sound along with your voice:** the system output is set to BlackHole, so everything playing goes into it. Choose your speakers or headphones under System Settings > Sound > Output.
 
 ## Project layout
 
 | Path | Contents |
 | --- | --- |
 | `crates/dsp` | The processing chain. Pure Rust with no OS or audio-device code, so it carries over to other platforms. |
-| `crates/mic-filter` | The program: CLI, config, the PipeWire backend (`engine.rs`), the meter socket (`ipc.rs`), and the window (`gui/`). |
+| `crates/mic-filter` | The program: CLI, config, the PipeWire backend (`engine.rs`), the macOS backend (`cpal_engine.rs`) and its clock bridge (`bridge.rs`), the meter socket (`ipc.rs`), and the window (`gui/`). |
+| `crates/mic-filter/macos/Info.plist` | The macOS app description, with the text macOS shows when it asks for microphone access. `build.rs` embeds it in the binary. |
 | `packaging/mic-filter.service` | systemd user unit. |
-| `scripts/install.sh` | Build, install and enable. |
+| `packaging/macos/mic-filter.plist` | launchd agent. |
+| `scripts/install.sh` | Build, install and enable. Runs `scripts/install-macos.sh` on a Mac. |
+| `.github/workflows/macos.yml` | Builds, tests and packages the macOS version on a Mac. |
 
 ## Development
 
@@ -216,9 +274,15 @@ cargo run -- run --meter
 
 The DSP crate builds and tests on any OS. The `mic-filter` crate needs the PipeWire headers on Linux. `cargo build --no-default-features` leaves out the window, for a headless install.
 
+To work on the macOS version without a Mac:
+
+- `rustup target add aarch64-apple-darwin`, then `cargo clippy --target aarch64-apple-darwin --all-targets` checks that it compiles. Linking needs a Mac.
+- `cargo run --features cpal-backend -- run --meter` runs the macOS backend on Linux through PipeWire. It also needs the ALSA headers (`libasound2-dev`). Set `[output] name` to a PipeWire sink for it to play into, such as one end of a `pw-loopback`.
+
 ## Speculation
 
 The following statements are untested plans or are based on reading WirePlumber's source code without a live test:
 
 - **Unplug behavior:** a simulated hotplug, where a virtual mic with the configured name was created and removed while an app recorded from Mic Filter, confirmed that capture starts when the mic appears and stops cleanly when it goes away. Moving back from a fallback mic to the returning mic comes from reading WirePlumber 0.4's policy code. Neither has been tested with a real USB or Bluetooth headset unplugged mid-call.
-- **macOS and Windows:** the plan is a second backend that captures with the `cpal` crate and writes to a virtual audio device such as BlackHole on macOS or VB-CABLE on Windows. Those systems need a driver to create a virtual mic, and those projects provide one. The `dsp` crate would be reused unchanged.
+- **macOS:** the macOS version compiles for Apple Silicon and Intel. Its audio code has run on Linux through the `cpal` crate's PipeWire support, including switching mics and changing settings while it runs, and its clock bridge passed simulations of mics running 150 ppm fast and 400 ppm slow for five minutes without a dropout. None of it has run on a Mac. Untested there: CoreAudio's device names and IDs, whether macOS shows the microphone prompt for the launchd agent, the install script, the app bundle, and what happens when another app changes BlackHole's sample rate, which makes mic-filter reopen it.
+- **Windows:** the plan is to reuse the macOS backend with VB-CABLE as the virtual device.

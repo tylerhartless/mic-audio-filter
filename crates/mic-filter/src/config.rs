@@ -53,17 +53,33 @@ impl InputConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct OutputConfig {
-    /// PipeWire node.name of the virtual mic.
+    /// On Linux, the PipeWire node.name of the virtual mic mic-filter
+    /// publishes. On macOS, the name or UID of the virtual device it plays
+    /// into.
     pub name: String,
-    /// The name apps show in their mic dropdowns.
+    /// The name apps show in their mic dropdowns. Linux only: on macOS the
+    /// virtual device names itself.
+    #[serde(skip_serializing_if = "unused_description")]
     pub description: String,
+}
+
+const DEFAULT_DESCRIPTION: &str = "Mic Filter";
+
+/// macOS has no use for `description`, so saving leaves it out of the file.
+fn unused_description(description: &str) -> bool {
+    cfg!(cpal_backend) && description == DEFAULT_DESCRIPTION
 }
 
 impl Default for OutputConfig {
     fn default() -> Self {
         Self {
-            name: "mic_filter".into(),
-            description: "Mic Filter".into(),
+            name: if cfg!(cpal_backend) {
+                "BlackHole 2ch"
+            } else {
+                "mic_filter"
+            }
+            .into(),
+            description: DEFAULT_DESCRIPTION.into(),
         }
     }
 }
@@ -267,8 +283,25 @@ fn with_input_device(text: &str, device: &str) -> Result<String> {
 /// `None` follows the system default.
 pub fn template(device: Option<&str>) -> String {
     let device = toml::Value::String(device.unwrap_or(DEFAULT_DEVICE).to_string());
-    TEMPLATE.replace("{DEVICE}", &device.to_string())
+    let output = if cfg!(cpal_backend) {
+        OUTPUT_CPAL
+    } else {
+        OUTPUT_PIPEWIRE
+    };
+    TEMPLATE
+        .replace("{DEVICE}", &device.to_string())
+        .replace("{OUTPUT}\n", output)
 }
+
+const OUTPUT_PIPEWIRE: &str = r#"# The virtual mic other apps record from.
+name = "mic_filter"
+description = "Mic Filter"
+"#;
+
+const OUTPUT_CPAL: &str = r#"# The virtual audio device mic-filter plays into. Pick it as the mic in
+# your apps. Get BlackHole with `brew install blackhole-2ch`.
+name = "BlackHole 2ch"
+"#;
 
 const TEMPLATE: &str = r#"# mic-filter config. Edits apply live while mic-filter is running,
 # except [output], which needs a restart.
@@ -280,9 +313,7 @@ const TEMPLATE: &str = r#"# mic-filter config. Edits apply live while mic-filter
 device = {DEVICE}
 
 [output]
-# The virtual mic other apps record from.
-name = "mic_filter"
-description = "Mic Filter"
+{OUTPUT}
 
 [gain]
 # Boost for a quiet mic. Watch `mic-filter run --meter`: speech should
@@ -364,6 +395,12 @@ mod tests {
             ChainSettings::default(),
             "template drifted from the code defaults"
         );
+    }
+
+    #[test]
+    fn template_output_matches_the_code_default() {
+        let c = Config::parse(&template(None)).unwrap();
+        assert_eq!(c.output, OutputConfig::default());
     }
 
     #[test]
