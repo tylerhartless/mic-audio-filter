@@ -4,6 +4,7 @@
 //! service's meter socket.
 
 mod eq;
+mod gate;
 mod meters;
 mod simple;
 
@@ -115,6 +116,8 @@ struct GuiApp {
     want_monitor: bool,
     /// Showing every setting, with the simple controls hidden.
     advanced: bool,
+    /// "Set from my voice" is listening.
+    calibration: Option<gate::Calibration>,
 }
 
 impl GuiApp {
@@ -157,6 +160,8 @@ impl GuiApp {
                             reduction_db: p.reduction_db.max(s.reduction_db),
                             vad: p.vad.max(s.vad),
                             streaming: s.streaming,
+                            gate_db: p.gate_db.max(s.gate_db),
+                            gate_open: p.gate_open || s.gate_open,
                         },
                         None => s,
                     });
@@ -185,6 +190,7 @@ impl GuiApp {
             want_preview: true,
             want_monitor: false,
             advanced: false,
+            calibration: None,
         }
     }
 
@@ -512,7 +518,7 @@ impl GuiApp {
         ui.weak("Turn this up if you're too quiet.");
         ui.add_space(18.0);
 
-        for control in &simple::CONTROLS {
+        for (i, control) in simple::CONTROLS.iter().enumerate() {
             section_title(ui, control.title);
             let current = control.current(&self.config);
             ui.horizontal(|ui| {
@@ -530,8 +536,59 @@ impl GuiApp {
                 }
             });
             ui.weak(control.help);
+            // The first control is background noise, whose Strong level turns
+            // on the voice gate.
+            let d = &self.config.denoise;
+            if i == 0 && d.enabled && d.vad_threshold > 0.0 {
+                self.gate_section(ui, streaming);
+            }
             ui.add_space(16.0);
         }
+    }
+
+    /// The voice gate's unmute level, shown while the gate is on.
+    fn gate_section(&mut self, ui: &mut egui::Ui, streaming: bool) {
+        ui.add_space(8.0);
+        ui.label("Unmute level");
+        if self
+            .meters
+            .show_gate(ui, &mut self.config.denoise.gate_level_db)
+        {
+            self.calibration = None;
+        }
+        ui.weak(format!(
+            "Sounds below the line ({:.0} dB) never unmute you. Drag it above noise from across the room.",
+            self.config.denoise.gate_level_db
+        ));
+        let label = match &self.calibration {
+            Some(c) => format!("Listening, keep talking... {}", c.seconds_left()),
+            None => "Set from my voice".into(),
+        };
+        let button = egui::Button::new(label);
+        if ui
+            .add_enabled(streaming && self.calibration.is_none(), button)
+            .on_hover_text("Talk normally for a few seconds, and the line moves a safe distance below your voice.")
+            .clicked()
+        {
+            self.calibration = Some(gate::Calibration::new());
+        }
+    }
+
+    fn finish_calibration(&mut self) {
+        let Some(calibration) = self.calibration.take() else {
+            return;
+        };
+        let notice = match calibration.level() {
+            Some(db) => {
+                self.config.denoise.gate_level_db = db;
+                format!("Unmute level set to {db:.0} dB.")
+            }
+            None => {
+                "Didn't hear enough talking. Press Set from my voice and talk until it finishes."
+                    .into()
+            }
+        };
+        self.set_notice(Notice::info(notice));
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -592,6 +649,16 @@ impl eframe::App for GuiApp {
             (feed.connected, feed.streaming, feed.pending.take())
         };
         let animating = self.meters.update(dt, reading, self.config.denoise.enabled);
+        if let (Some(calibration), Some(r)) = (&mut self.calibration, &reading) {
+            calibration.add(r);
+        }
+        if self
+            .calibration
+            .as_ref()
+            .is_some_and(gate::Calibration::done)
+        {
+            self.finish_calibration();
+        }
         self.sync_children(connected);
         self.check_file();
         let stale = {
@@ -635,6 +702,8 @@ impl eframe::App for GuiApp {
         self.save_if_changed();
         let next = if animating {
             Duration::from_millis(16)
+        } else if self.calibration.is_some() {
+            Duration::from_millis(100)
         } else if self.config != self.saved {
             SAVE_INTERVAL
         } else {
@@ -706,6 +775,14 @@ fn source_cards(ui: &mut egui::Ui, c: &mut Config) {
                 egui::Slider::new(&mut d.vad_hold_ms, 0.0..=2000.0)
                     .step_by(10.0)
                     .suffix(" ms"),
+            );
+            slider_row(
+                ui,
+                "Gate level",
+                gate_on,
+                egui::Slider::new(&mut d.gate_level_db, -80.0..=0.0)
+                    .step_by(1.0)
+                    .suffix(" dB"),
             );
         },
     );
@@ -841,7 +918,7 @@ fn dynamics_cards(ui: &mut egui::Ui, c: &mut Config) {
 }
 
 const INPUT_HINT: &str = "Raise the input gain until In sits in its shaded zone while you talk. The high-pass removes rumble and desk thumps.";
-const NOISE_HINT: &str = "Lower the strength if your voice sounds watery. The voice gate mutes you between sentences; start around 50%.";
+const NOISE_HINT: &str = "Lower the strength if your voice sounds watery. The voice gate mutes you between sentences; start around 50%. Raise the gate level if sounds across the room unmute you.";
 const COMPRESSOR_HINT: &str = "Aim for 3 to 8 dB on the Comp meter while you talk. A lower threshold or a higher ratio compresses more.";
 const DEESSER_HINT: &str = "Turns down harsh \"s\" sounds. A lower threshold catches more; move the frequency to where your S sounds are sharpest.";
 const OUTPUT_HINT: &str =

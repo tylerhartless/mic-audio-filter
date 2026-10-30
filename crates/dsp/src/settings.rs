@@ -65,6 +65,10 @@ pub struct DenoiseSettings {
     pub vad_threshold: f32,
     /// How long the voice gate stays open after speech stops.
     pub vad_hold_ms: f32,
+    /// The voice gate also stays shut for anything quieter than this peak
+    /// level, measured after noise removal. Voices across the room reach a
+    /// close mic much quieter than yours.
+    pub gate_level_db: f32,
 }
 
 impl Default for DenoiseSettings {
@@ -74,6 +78,7 @@ impl Default for DenoiseSettings {
             strength: 1.0,
             vad_threshold: 0.0,
             vad_hold_ms: 300.0,
+            gate_level_db: -50.0,
         }
     }
 }
@@ -233,6 +238,13 @@ impl ChainSettings {
         check(
             (0.0..=5000.0).contains(&d.vad_hold_ms),
             format!("denoise.vad_hold_ms = {} is outside 0..5000", d.vad_hold_ms),
+        );
+        check(
+            (-80.0..=0.0).contains(&d.gate_level_db),
+            format!(
+                "denoise.gate_level_db = {} is outside -80..0",
+                d.gate_level_db
+            ),
         );
 
         check(

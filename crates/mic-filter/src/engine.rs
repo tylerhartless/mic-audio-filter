@@ -215,6 +215,8 @@ pub fn run(opts: Options) -> Result<()> {
                 reduction_db: reading.reduction_db,
                 vad: reading.vad,
                 streaming: streaming.get(),
+                gate_db: reading.gate_peak_db,
+                gate_open: reading.gate_open,
             });
         }
         if opts.meter {

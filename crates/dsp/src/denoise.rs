@@ -1,6 +1,7 @@
 //! RNNoise noise suppression (via the pure-Rust `nnnoiseless` port) with an
 //! optional voice-activity gate.
 
+use crate::dynamics::db_to_lin;
 use crate::settings::DenoiseSettings;
 use nnnoiseless::DenoiseState;
 
@@ -10,12 +11,20 @@ pub const FRAME: usize = DenoiseState::FRAME_SIZE;
 /// RNNoise expects samples scaled like 16-bit integers.
 const I16_SCALE: f32 = 32768.0;
 
+/// Once open, the gate closes this far below its opening level, so a sound
+/// sitting right at the level doesn't flutter it.
+const GATE_HYSTERESIS_DB: f32 = 6.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct DenoiseParams {
     pub enabled: bool,
     strength: f32,
     vad_threshold: f32,
     hold_frames: u32,
+    /// Peak levels the gate needs to open and to stay open, in RNNoise's
+    /// 16-bit scale.
+    open_level: f32,
+    close_level: f32,
 }
 
 impl DenoiseParams {
@@ -26,6 +35,8 @@ impl DenoiseParams {
             strength: s.strength.clamp(0.0, 1.0),
             vad_threshold: s.vad_threshold.clamp(0.0, 1.0),
             hold_frames: (s.vad_hold_ms / frame_ms).ceil() as u32,
+            open_level: db_to_lin(s.gate_level_db) * I16_SCALE,
+            close_level: db_to_lin(s.gate_level_db - GATE_HYSTERESIS_DB) * I16_SCALE,
         }
     }
 }
@@ -44,6 +55,10 @@ pub struct Denoiser {
     gate: f32,
     hold_left: u32,
     last_vad: f32,
+    /// Highest frame peak the gate measured, and whether it was open, since
+    /// the last [`Self::take_gate_reading`].
+    level_peak: f32,
+    was_open: bool,
 }
 
 impl Default for Denoiser {
@@ -65,6 +80,8 @@ impl Denoiser {
             gate: 1.0,
             hold_left: 0,
             last_vad: 0.0,
+            level_peak: 0.0,
+            was_open: false,
         }
     }
 
@@ -81,6 +98,16 @@ impl Denoiser {
     /// Voice probability RNNoise reported for the most recent frame.
     pub fn last_vad(&self) -> f32 {
         self.last_vad
+    }
+
+    /// The highest peak level the gate measured (linear, after noise
+    /// removal), and whether the gate was open at any point, since the last
+    /// call.
+    pub fn take_gate_reading(&mut self) -> (f32, bool) {
+        let reading = (self.level_peak / I16_SCALE, self.was_open);
+        self.level_peak = 0.0;
+        self.was_open = false;
+        reading
     }
 
     /// Delay this stage adds: one frame of buffering plus RNNoise's own frame.
@@ -108,7 +135,16 @@ impl Denoiser {
             .process_frame(&mut self.scratch, &self.collecting);
         self.last_vad = vad;
 
-        let target = if p.vad_threshold <= 0.0 || vad >= p.vad_threshold {
+        // The gate opens for frames that sound like a voice and are loud
+        // enough to be the person at the mic.
+        let level = self.scratch.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+        self.level_peak = self.level_peak.max(level);
+        let min_level = if self.gate > 0.0 {
+            p.close_level
+        } else {
+            p.open_level
+        };
+        let target = if p.vad_threshold <= 0.0 || (vad >= p.vad_threshold && level >= min_level) {
             self.hold_left = p.hold_frames;
             1.0
         } else if self.hold_left > 0 {
@@ -128,6 +164,7 @@ impl Denoiser {
             self.ready[i] = (wet * self.scratch[i] + dry * self.dry[i]) * gate / I16_SCALE;
         }
         self.gate = target;
+        self.was_open |= target > 0.0;
         self.dry = self.collecting;
     }
 }
@@ -144,9 +181,41 @@ mod tests {
                 strength,
                 vad_threshold,
                 vad_hold_ms: 0.0,
+                gate_level_db: -80.0,
             },
             48_000.0,
         )
+    }
+
+    /// The voice gate at a -40 dB unmute level, holding over brief dips in
+    /// RNNoise's voice score.
+    fn gate_params() -> DenoiseParams {
+        DenoiseParams::new(
+            &DenoiseSettings {
+                enabled: true,
+                strength: 1.0,
+                vad_threshold: 0.5,
+                vad_hold_ms: 100.0,
+                gate_level_db: -40.0,
+            },
+            48_000.0,
+        )
+    }
+
+    fn run(d: &mut Denoiser, p: &DenoiseParams, buf: &mut [f32]) {
+        for chunk in buf.chunks_mut(256) {
+            d.process(p, chunk);
+        }
+    }
+
+    /// The fraction of 10 ms frames with any sound in them.
+    fn open_fraction(buf: &[f32]) -> f32 {
+        let frames: Vec<_> = buf.chunks(FRAME).collect();
+        let open = frames
+            .iter()
+            .filter(|f| f.iter().any(|&x| x != 0.0))
+            .count();
+        open as f32 / frames.len() as f32
     }
 
     #[test]
@@ -208,5 +277,56 @@ mod tests {
             d.process(&p, chunk);
         }
         assert!(buf[48_000..].iter().all(|&x| x == 0.0));
+    }
+
+    /// A buzzy tone with speech-like harmonics around a 150 Hz pitch.
+    fn voiced(len: usize, amp: f32) -> Vec<f32> {
+        (0..len)
+            .map(|n| {
+                let t = n as f32 / 48_000.0;
+                let f0 = 150.0 * (1.0 + 0.03 * (2.0 * std::f32::consts::PI * 4.0 * t).sin());
+                let phase = 2.0 * std::f32::consts::PI * f0 * t;
+                let x: f32 = (1..=20).map(|k| (k as f32 * phase).sin() / k as f32).sum();
+                x * amp * 0.5
+            })
+            .collect()
+    }
+
+    #[test]
+    fn gate_ignores_quiet_voices() {
+        let mut d = Denoiser::new();
+        // About -59 dB: a voice across the room.
+        let mut buf = voiced(96_000, 0.001);
+        run(&mut d, &gate_params(), &mut buf);
+        assert!(buf[4_800..].iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn gate_opens_for_loud_voices() {
+        let mut d = Denoiser::new();
+        let mut buf = voiced(96_000, 0.3);
+        run(&mut d, &gate_params(), &mut buf);
+        let open = open_fraction(&buf[4_800..]);
+        assert!(open > 0.95, "open for only {:.0}% of frames", open * 100.0);
+    }
+
+    #[test]
+    fn gate_stays_open_just_below_its_level() {
+        // About -43 dB: below the -40 dB unmute level, above where an open
+        // gate closes.
+        let quiet = 0.0063;
+        let p = gate_params();
+
+        let mut d = Denoiser::new();
+        let mut buf = voiced(96_000, quiet);
+        run(&mut d, &p, &mut buf);
+        assert!(buf[4_800..].iter().all(|&x| x == 0.0), "opened from closed");
+
+        let mut d = Denoiser::new();
+        let mut buf = voiced(96_000, 0.3);
+        buf[48_000..].iter_mut().for_each(|x| *x *= quiet / 0.3);
+        run(&mut d, &p, &mut buf);
+        let open = open_fraction(&buf[72_000..]);
+        assert!(open > 0.95, "open for only {:.0}% of frames", open * 100.0);
     }
 }

@@ -74,6 +74,8 @@ pub struct Meters {
     output_peak: AtomicU32,
     reduction_db: AtomicU32,
     vad: AtomicU32,
+    gate_peak: AtomicU32,
+    gate_open: AtomicU32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +85,10 @@ pub struct MeterReading {
     pub output_peak_db: f32,
     pub reduction_db: f32,
     pub vad: f32,
+    /// Peak after noise removal, before the voice gate: the level the gate
+    /// compares with `gate_level_db`.
+    pub gate_peak_db: f32,
+    pub gate_open: bool,
 }
 
 impl Meters {
@@ -104,6 +110,8 @@ impl Meters {
             output_peak_db: lin_to_db(Self::take_one(&self.output_peak)),
             reduction_db: Self::take_one(&self.reduction_db),
             vad: Self::take_one(&self.vad),
+            gate_peak_db: lin_to_db(Self::take_one(&self.gate_peak)),
+            gate_open: Self::take_one(&self.gate_open) > 0.0,
         }
     }
 }
@@ -231,6 +239,9 @@ impl Chain {
         Meters::bump(&self.meters.reduction_db, reduction);
         if p.denoise.enabled {
             Meters::bump(&self.meters.vad, self.denoiser.last_vad());
+            let (gate_peak, gate_open) = self.denoiser.take_gate_reading();
+            Meters::bump(&self.meters.gate_peak, gate_peak);
+            Meters::bump(&self.meters.gate_open, f32::from(u8::from(gate_open)));
         }
     }
 

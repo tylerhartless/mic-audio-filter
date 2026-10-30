@@ -25,6 +25,9 @@ pub struct Snapshot {
     pub vad: f32,
     /// Some app is recording from the virtual mic, so audio is flowing.
     pub streaming: bool,
+    /// The level the voice gate measures, and whether it let sound through.
+    pub gate_db: f32,
+    pub gate_open: bool,
 }
 
 impl Default for Snapshot {
@@ -35,6 +38,8 @@ impl Default for Snapshot {
             reduction_db: 0.0,
             vad: 0.0,
             streaming: false,
+            gate_db: -120.0,
+            gate_open: false,
         }
     }
 }
@@ -42,12 +47,14 @@ impl Default for Snapshot {
 impl Snapshot {
     fn encode(&self) -> String {
         format!(
-            "{:.1} {:.1} {:.1} {:.3} {}\n",
+            "{:.1} {:.1} {:.1} {:.3} {} {:.1} {}\n",
             self.input_db.max(-120.0),
             self.output_db.max(-120.0),
             self.reduction_db,
             self.vad,
-            u8::from(self.streaming)
+            u8::from(self.streaming),
+            self.gate_db.max(-120.0),
+            u8::from(self.gate_open),
         )
     }
 
@@ -61,6 +68,8 @@ impl Snapshot {
             reduction_db: next()?,
             vad: next()?,
             streaming: next()? != 0.0,
+            gate_db: next()?,
+            gate_open: next()? != 0.0,
         })
     }
 }
@@ -162,6 +171,8 @@ mod tests {
             reduction_db: 4.5,
             vad: 0.875,
             streaming: true,
+            gate_db: -27.4,
+            gate_open: true,
         };
         assert_eq!(Snapshot::decode(s.encode().trim()), Some(s));
         assert_eq!(Snapshot::decode("garbage"), None);

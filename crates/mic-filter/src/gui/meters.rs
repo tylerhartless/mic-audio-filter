@@ -1,7 +1,7 @@
 //! Level meters fed by the service's meter socket.
 
 use crate::ipc::Snapshot;
-use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, StrokeKind, Vec2};
+use eframe::egui::{self, Align2, Color32, FontId, Rect, Sense, Stroke, StrokeKind, Vec2};
 use std::time::{Duration, Instant};
 
 /// How fast a displayed peak falls back once the level drops.
@@ -12,6 +12,8 @@ const FLOOR_DB: f32 = -60.0;
 const SPEECH_TARGET_DB: (f32, f32) = (-18.0, -3.0);
 /// How long the simple view keeps judging your level after you stop talking.
 const SPEECH_MEMORY: Duration = Duration::from_secs(3);
+/// The highest unmute level the gate bar's line can be dragged to.
+const GATE_MAX_DB: f32 = -5.0;
 
 const QUIET: Color32 = Color32::from_rgb(90, 140, 205);
 const GOOD: Color32 = Color32::from_rgb(80, 190, 110);
@@ -28,6 +30,10 @@ pub struct Meters {
     /// Recent output peak while you were talking, for the simple view.
     speech_db: f32,
     last_speech: Option<Instant>,
+    /// The level the voice gate measures, after noise removal.
+    gate_db: f32,
+    /// Seconds left to show the gate as open.
+    gate_open_left: f32,
 }
 
 impl Default for Meters {
@@ -39,6 +45,8 @@ impl Default for Meters {
             vad: 0.0,
             speech_db: FLOOR_DB,
             last_speech: None,
+            gate_db: FLOOR_DB,
+            gate_open_left: 0.0,
         }
     }
 }
@@ -54,6 +62,8 @@ impl Meters {
         self.output_db = (self.output_db - fall).max(FLOOR_DB);
         self.reduction_db = (self.reduction_db - fall).max(0.0);
         self.vad = (self.vad - 2.0 * dt).max(0.0);
+        self.gate_db = (self.gate_db - fall).max(FLOOR_DB);
+        self.gate_open_left = (self.gate_open_left - dt).max(0.0);
         // Falls slowly, so the verdict doesn't flicker between words.
         self.speech_db = (self.speech_db - 4.0 * dt).max(FLOOR_DB);
         if let Some(r) = reading {
@@ -61,6 +71,10 @@ impl Meters {
             self.output_db = self.output_db.max(r.output_db);
             self.reduction_db = self.reduction_db.max(r.reduction_db);
             self.vad = self.vad.max(r.vad);
+            self.gate_db = self.gate_db.max(r.gate_db);
+            if r.gate_open {
+                self.gate_open_left = 0.1;
+            }
             let talking = if voice_detection {
                 r.vad > 0.6
             } else {
@@ -75,6 +89,8 @@ impl Meters {
             || self.output_db > FLOOR_DB
             || self.reduction_db > 0.0
             || self.vad > 0.0
+            || self.gate_db > FLOOR_DB
+            || self.gate_open_left > 0.0
     }
 
     /// One bar for what apps hear, and a plain-words verdict on your level.
@@ -129,6 +145,58 @@ impl Meters {
             (GOOD, "Sounds good.")
         };
         ui.label(egui::RichText::new(text).color(color));
+    }
+
+    /// The level the voice gate hears, with its unmute level as a line you
+    /// drag. The bar turns green while the gate lets sound through. Returns
+    /// true when the line moved.
+    pub fn show_gate(&self, ui: &mut egui::Ui, level_db: &mut f32) -> bool {
+        let (rect, response) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), 28.0),
+            Sense::click_and_drag(),
+        );
+        let response = response
+            .on_hover_cursor(egui::CursorIcon::ResizeHorizontal)
+            .on_hover_text("Drag to set how loud a sound must be to unmute you.");
+        let mut changed = false;
+        if let Some(pos) = response.interact_pointer_pos() {
+            let fraction = ((pos.x - rect.left()) / rect.width()).clamp(0.0, 1.0);
+            let db = (FLOOR_DB * (1.0 - fraction)).round().min(GATE_MAX_DB);
+            changed = db != *level_db;
+            *level_db = db;
+        }
+
+        let painter = ui.painter_at(rect);
+        let visuals = ui.visuals();
+        let x_at = |db: f32| rect.left() + db_fraction(db) * rect.width();
+        let line_x = x_at(*level_db);
+        painter.rect_filled(rect, 5.0, visuals.extreme_bg_color);
+        painter.rect_filled(
+            Rect::from_x_y_ranges(rect.left()..=line_x, rect.y_range()),
+            0.0,
+            CLIP.gamma_multiply(0.12),
+        );
+        if self.gate_db > FLOOR_DB {
+            let level = Rect::from_x_y_ranges(rect.left()..=x_at(self.gate_db), rect.y_range());
+            let color = if self.gate_open_left > 0.0 {
+                GOOD
+            } else {
+                visuals.weak_text_color()
+            };
+            painter.rect_filled(level.shrink(4.0), 3.0, color);
+        }
+        painter.rect_stroke(
+            rect,
+            5.0,
+            visuals.widgets.noninteractive.bg_stroke,
+            StrokeKind::Inside,
+        );
+        painter.vline(
+            line_x,
+            rect.y_range(),
+            Stroke::new(3.0, visuals.strong_text_color()),
+        );
+        changed
     }
 
     pub fn show(&self, ui: &mut egui::Ui) {

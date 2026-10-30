@@ -108,6 +108,7 @@ Open **Mic Filter** from the app menu, or run `mic-filter gui`.
 - **Your level:** say a few words, and the bar tells you whether you're too quiet, too loud, or good. **Hear myself** plays your processed mic into your headphones.
 - **Mic boost:** turn it up if you're too quiet.
 - **Remove background noise, Even out my volume, Soften harsh S sounds, Reduce pops and rumble:** pick Off, Light, Medium or Strong.
+- **Unmute level:** appears under Strong, which mutes you when you aren't talking. The bar shows what the mic hears after noise removal and turns green when it unmutes you. Sounds quieter than the line never unmute you, even ones that sound like a voice, such as people or a TV across the room. Drag the line, or press **Set from my voice** and talk for four seconds to put it 15 dB below your usual level.
 
 Every change saves and applies right away.
 
@@ -136,6 +137,7 @@ The window, the service and the config file stay in sync: an edit made in a text
 Common adjustments:
 
 - **Background noise between sentences:** pick Strong under Remove background noise, which mutes the mic when you're not talking. If word endings get cut off, raise Gate hold under Advanced.
+- **Voices or noise across the room unmute you:** drag the Unmute level line to the right of where the bar reaches while you're silent. If the starts of your words get cut off, drag it left.
 - **Voice sounds watery or robotic:** pick Light under Remove background noise.
 - **S sounds still harsh on Strong:** under Advanced, lower the De-esser threshold, or move its frequency to where your S sounds are sharpest.
 - **Boomy or muddy:** pick Strong under Reduce pops and rumble, or cut around 200 to 300 Hz in the EQ.
@@ -168,7 +170,7 @@ Edit `~/.config/mic-filter/config.toml` in another window and save. When you're 
 | `[output]` | `name` and `description` of the virtual mic. | Restart needed |
 | `[gain]` | `input_db` boost before processing, `output_db` trim before the limiter. | Yes |
 | `[highpass]` | Removes rumble below `freq_hz`. | Yes |
-| `[denoise]` | RNNoise suppression with `strength`, plus the optional voice gate. | Yes |
+| `[denoise]` | RNNoise suppression with `strength`, plus the optional voice gate. The gate opens for sounds RNNoise rates as a voice (`vad_threshold`) that also peak above `gate_level_db`. | Yes |
 | `[eq]` | Up to 16 bands: `peaking`, `low_shelf`, `high_shelf`, `low_pass`, `high_pass`, `notch`. | Yes |
 | `[compressor]` | Soft-knee compressor: `threshold_db`, `ratio`, `knee_db`, `attack_ms`, `release_ms`, `makeup_db`. | Yes |
 | `[deesser]` | Cuts the band around `freq_hz` while it's louder than `threshold_db`, by up to `max_reduction_db`. | Yes |

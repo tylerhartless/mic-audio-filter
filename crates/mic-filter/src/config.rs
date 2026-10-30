@@ -306,6 +306,9 @@ strength = 1.0
 # 0.0 = off. Try 0.5 to 0.8 to kill residual noise between sentences.
 vad_threshold = 0.0
 vad_hold_ms = 300.0
+# The gate also stays shut for sounds with peaks quieter than this (dBFS,
+# after noise removal). Raise it if voices across the room unmute you.
+gate_level_db = -50.0
 
 [eq]
 enabled = true
