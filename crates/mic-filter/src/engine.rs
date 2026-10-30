@@ -7,9 +7,10 @@
 //!   capture to our own output, which would loop.
 //! - The capture side is passive, so the real mic only runs while some app is
 //!   recording from the virtual mic.
-//! - The output stream uses `TRIGGER`: each capture cycle triggers it, and its
-//!   process callback pulls the captured buffer, runs the chain, and emits the
-//!   result in the same graph cycle, so the streams add no buffering.
+//! - The capture callback runs the chain and hands the buffer straight back.
+//!   The output stream uses `TRIGGER`: the capture callback triggers it, and
+//!   it emits the processed block in the same graph cycle, so the streams add
+//!   no buffering.
 //! - Switching mics reconnects only the capture stream. The virtual mic stays
 //!   up, so apps keep it selected and hear a short gap.
 
@@ -108,21 +109,25 @@ pub fn run(opts: Options) -> Result<()> {
     let (params_tx, params_rx) = rtrb::RingBuffer::<ChainParams>::new(16);
     let chain = Chain::new(ChainParams::new(&cfg.chain()), meters.clone());
 
-    // The two process callbacks reach each other's stream through raw
-    // pointers, exactly as filter-chain does in C. Both streams outlive both
-    // listeners: the listeners are dropped first at the end of this function.
-    let capture_ptr: *const Stream = &*capture;
+    // Both process callbacks run on the same data thread and share the
+    // processor. The capture callback reaches the output stream through a raw
+    // pointer, as filter-chain does in C. The output stream outlives the
+    // listener: the listeners are dropped first at the end of this function.
+    let processor = Rc::new(RefCell::new(Processor::new(chain, params_rx)));
     let output_ptr: *const Stream = &*output;
 
     let device_label = Rc::new(RefCell::new(input_label(&cfg.input)));
     let _capture_listener = capture
         .add_local_listener_with_user_data(())
-        .process(move |capture, _| {
-            // SAFETY: see above; the output stream outlives this listener.
-            let output = unsafe { &*output_ptr };
-            if output.trigger_process().is_err() {
-                // The output side isn't ready: recycle the input buffers.
-                while capture.dequeue_buffer().is_some() {}
+        .process({
+            let processor = processor.clone();
+            move |capture, _| {
+                processor.borrow_mut().capture(capture);
+                // SAFETY: see above; the output stream outlives this listener.
+                let output = unsafe { &*output_ptr };
+                if output.trigger_process().is_err() {
+                    processor.borrow_mut().discard();
+                }
             }
         })
         .state_changed({
@@ -138,13 +143,8 @@ pub fn run(opts: Options) -> Result<()> {
     let streaming = Rc::new(Cell::new(false));
     let description = cfg.output.description.clone();
     let _output_listener = output
-        .add_local_listener_with_user_data(Processor {
-            chain,
-            params_rx,
-            capture: capture_ptr,
-            last_len: 0,
-        })
-        .process(|output, p| p.process(output))
+        .add_local_listener_with_user_data(())
+        .process(move |output, _| processor.borrow_mut().emit(output))
         .state_changed({
             let streaming = streaming.clone();
             move |_, _, old, new| {
@@ -293,33 +293,76 @@ fn set_target(stream: &Stream, target: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// PipeWire's largest quantum, so the largest block a cycle can capture.
+const MAX_BLOCK: usize = 8192;
+
 /// Lives on PipeWire's real-time data thread. Must not allocate or block.
 struct Processor {
     chain: Chain,
     params_rx: rtrb::Consumer<ChainParams>,
-    capture: *const Stream,
+    /// The latest processed block, waiting for the output stream.
+    block: Box<[f32]>,
+    ready: usize,
     /// Block size of the previous cycle, reused if a cycle has no input.
     last_len: usize,
 }
 
 impl Processor {
-    fn process(&mut self, output: &Stream) {
-        // SAFETY: the capture stream outlives the output listener.
-        let capture = unsafe { &*self.capture };
+    fn new(chain: Chain, params_rx: rtrb::Consumer<ChainParams>) -> Self {
+        Self {
+            chain,
+            params_rx,
+            block: vec![0.0; MAX_BLOCK].into_boxed_slice(),
+            ready: 0,
+            last_len: 0,
+        }
+    }
 
+    /// Capture side: runs the chain on the newest captured buffer.
+    ///
+    /// The buffer has to go back to PipeWire before this callback returns.
+    /// The capture stream may own a single buffer, and PipeWire 1.0 only
+    /// recycles it at that point; a buffer held until the output callback
+    /// runs leaves the next cycle with nowhere to capture into, which drops
+    /// every other cycle.
+    fn capture(&mut self, capture: &Stream) {
         // Keep only the newest captured buffer; older ones go back to the pool.
         let mut input = None;
         while let Some(b) = capture.dequeue_buffer() {
             input = Some(b);
         }
-        let Some(mut out_buf) = output.dequeue_buffer() else {
+        let Some(mut buf) = input else { return };
+        let d = &mut buf.datas_mut()[0];
+        let (offset, size) = (d.chunk().offset() as usize, d.chunk().size() as usize);
+        let Some(bytes) = d.data() else { return };
+        let end = (offset + size).min(bytes.len());
+        // SAFETY: f32 has no invalid bit patterns; misalignment is checked.
+        let (head, samples, _) = unsafe { bytes[offset.min(end)..end].align_to::<f32>() };
+        if !head.is_empty() {
             return;
-        };
+        }
+        let n = samples.len().min(self.block.len());
+        self.block[..n].copy_from_slice(&samples[..n]);
+        drop(buf);
 
         while let Ok(p) = self.params_rx.pop() {
             self.chain.set_params(p);
         }
+        self.chain.process(&mut self.block[..n]);
+        self.ready = n;
+    }
 
+    /// The output stream couldn't be triggered, so this block is never sent.
+    fn discard(&mut self) {
+        self.ready = 0;
+    }
+
+    /// Output side: emits the processed block, or silence if this cycle
+    /// captured nothing.
+    fn emit(&mut self, output: &Stream) {
+        let Some(mut out_buf) = output.dequeue_buffer() else {
+            return;
+        };
         let requested = out_buf.requested() as usize;
         let out_data = &mut out_buf.datas_mut()[0];
         let len = {
@@ -333,31 +376,16 @@ impl Processor {
             if requested > 0 {
                 len = len.min(requested);
             }
-
-            let copied = input.as_mut().and_then(|b| {
-                let d = &mut b.datas_mut()[0];
-                let (offset, size) = (d.chunk().offset() as usize, d.chunk().size() as usize);
-                let bytes = d.data()?;
-                let end = (offset + size).min(bytes.len());
-                let (head, samples, _) = unsafe { bytes[offset.min(end)..end].align_to::<f32>() };
-                if !head.is_empty() {
-                    return None;
-                }
-                let n = len.min(samples.len());
-                out[..n].copy_from_slice(&samples[..n]);
-                Some(n)
-            });
-            let len = match copied {
-                Some(n) => n,
-                None => {
-                    let n = len.min(self.last_len);
-                    out[..n].fill(0.0);
-                    n
-                }
-            };
-            self.chain.process(&mut out[..len]);
+            if self.ready > 0 {
+                len = len.min(self.ready);
+                out[..len].copy_from_slice(&self.block[..len]);
+            } else {
+                len = len.min(self.last_len);
+                out[..len].fill(0.0);
+            }
             len
         };
+        self.ready = 0;
         self.last_len = len;
 
         let chunk = out_data.chunk_mut();
